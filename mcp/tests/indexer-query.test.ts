@@ -507,7 +507,8 @@ test("stdio get_task adds a context recovery comment from the second retrieval",
     assert.deepEqual(second.data, {
       token: published.data.token,
       task: "恢复这个任务。",
-      comment: "如果你是在恢复上下文，就继续调用 codex_session_recent_user_inputs，并按需调用 codex_session_messages。"
+      comment:
+        "If you are recovering context, continue with codex_session_recent_user_inputs, then call codex_session_messages as needed."
     });
   } finally {
     await client.close().catch(() => undefined);

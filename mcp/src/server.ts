@@ -14,7 +14,7 @@ const orderSchema = z.enum(["asc", "desc"]).default("desc");
 const roleSchema = z.enum(["user", "assistant", "developer", "system", "tool", "unknown"]);
 const searchScopeSchema = z.enum(["messages", "tool_calls", "tool_outputs", "raw_events", "all"]).default("messages");
 const repeatedTaskRetrievalComment =
-  "如果你是在恢复上下文，就继续调用 codex_session_recent_user_inputs，并按需调用 codex_session_messages。";
+  "If you are recovering context, continue with codex_session_recent_user_inputs, then call codex_session_messages as needed.";
 const publishedTaskComment =
   "For every later instruction update to the agent, use the same handoff: call codex_session_publish_task, then send the returned prompt verbatim.";
 
