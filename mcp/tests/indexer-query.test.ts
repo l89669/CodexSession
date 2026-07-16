@@ -493,7 +493,7 @@ test("stdio get_task adds a context recovery comment from the second retrieval",
 
   try {
     await withTimeout(client.connect(transport), 2_000, "MCP initialize should complete");
-    const published = await callToolJson(client, "codex_session_publish_task", { task: "恢复这个任务。" });
+    const published = await callToolJson(client, "codex_session_publish_task", { task: "Recover this task." });
     assert.deepEqual(published.data, {
       token: published.data.token,
       prompt: `token: ${published.data.token}, use codex_session_get_task tool to retrieve exact instruction`,
@@ -503,10 +503,10 @@ test("stdio get_task adds a context recovery comment from the second retrieval",
     const first = await callToolJson(client, "codex_session_get_task", { token: published.data.token });
     const second = await callToolJson(client, "codex_session_get_task", { token: published.data.token });
 
-    assert.deepEqual(first.data, { token: published.data.token, task: "恢复这个任务。" });
+    assert.deepEqual(first.data, { token: published.data.token, task: "Recover this task." });
     assert.deepEqual(second.data, {
       token: published.data.token,
-      task: "恢复这个任务。",
+      task: "Recover this task.",
       comment:
         "If you are recovering context, continue with codex_session_recent_user_inputs, then call codex_session_messages as needed."
     });
