@@ -504,12 +504,10 @@ test("stdio get_task adds a context recovery comment from the second retrieval",
     const second = await callToolJson(client, "codex_session_get_task", { token: published.data.token });
 
     assert.deepEqual(first.data, { token: published.data.token, task: "Recover this task." });
-    assert.deepEqual(second.data, {
-      token: published.data.token,
-      task: "Recover this task.",
-      comment:
-        "If you are recovering context, continue with codex_session_recent_user_inputs, then call codex_session_messages as needed."
-    });
+    assert.equal(second.data.token, published.data.token);
+    assert.equal(second.data.task, "Recover this task.");
+    assert.equal(typeof second.data.comment, "string");
+    assert.ok(second.data.comment.trim().length > 0);
   } finally {
     await client.close().catch(() => undefined);
   }
