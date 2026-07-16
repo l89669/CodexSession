@@ -1,6 +1,6 @@
 {
   "name": "codex-session-context",
-  "version": "0.1.0+codex.20260715155628",
+  "version": "0.1.0+codex.20260716054354",
   "description": "Keep an agent's effective inputs recoverable across context compression and parent-to-child task handoff.",
   "author": {
     "name": "l89669"

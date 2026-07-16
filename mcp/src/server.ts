@@ -118,9 +118,9 @@ export async function createServer(options: { codexHome?: string; indexDbPath?: 
   registerJsonTool(server, "codex_session_find_by_text", {
     title: "Find Codex Session By Original Text",
     description:
-      "Deprecated fallback: locate a unique Codex session/message by a distinctive original text snippet. Prefer codex_session_get_session_token followed by codex_session_get_session_by_token for current-session recovery.",
+      "Deprecated fallback: locate a unique Codex session by a distinctive message, published task text, or published task token. Results identify message and published_task_retrieval matches explicitly. Prefer codex_session_get_session_token followed by codex_session_get_session_by_token for current-session recovery.",
     inputSchema: {
-      text: z.string().min(1).describe("Original transcript text to locate. Fewer than 8 effective characters is rejected."),
+      text: z.string().min(1).describe("Original message text, published task text, or published task token to locate. Fewer than 8 effective characters is rejected."),
       archive_scope: archiveScopeSchema.describe("active, archived, or both. Defaults to active."),
       include_candidates: z.boolean().optional().describe("When ambiguous, include diagnostic candidates. Defaults to false."),
       max_chars: z.number().int().positive().max(100000).optional().describe("Maximum snippet characters.")

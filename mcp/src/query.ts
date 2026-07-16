@@ -21,6 +21,23 @@ interface QueryContext {
   waitForIdleMs?: number;
 }
 
+interface FindTextRow {
+  session_id: string;
+  thread_name: string | null;
+  cwd: string | null;
+  updated_at: string | null;
+  archive_scope: ArchiveScope;
+  sequence: number;
+  timestamp: string | null;
+  source_type: "message" | "published_task_retrieval";
+  role: string | null;
+  searchable_text: string;
+  token: string | null;
+  call_id: string | null;
+  tool_name: string | null;
+  occurrences: number;
+}
+
 export class CodexSessionQueries {
   private readonly db: Db;
   private readonly indexer: CodexSessionIndexer;
@@ -180,37 +197,58 @@ export class CodexSessionQueries {
     }
 
     const archiveScope = args.archive_scope ?? "active";
-    const params: unknown[] = [`%${text}%`];
-    const where = ["m.content_text LIKE ?"];
-    addArchiveScope(where, params, archiveScope, "s.archive_scope");
+    const pattern = `%${text}%`;
+    const params: unknown[] = [pattern, pattern];
+    const where = ["(searchable_text LIKE ? OR token LIKE ?)"];
+    addArchiveScope(where, params, archiveScope, "archive_scope");
 
     const rows = this.db
       .prepare(
         `SELECT
-           s.session_id,
-           s.thread_name,
-           s.cwd,
-           s.updated_at,
-           s.archive_scope,
-           m.sequence,
-           m.timestamp,
-           m.role,
-           m.content_text
-         FROM messages m
-         JOIN sessions s ON s.session_id = m.session_id
+           session_id, thread_name, cwd, updated_at, archive_scope,
+           sequence, timestamp, source_type, role, searchable_text,
+           token, call_id, tool_name, occurrences
+         FROM (
+           SELECT
+             s.session_id, s.thread_name, s.cwd, s.updated_at, s.archive_scope,
+             m.sequence, m.timestamp, 'message' AS source_type,
+             m.role, m.content_text AS searchable_text,
+             NULL AS token, NULL AS call_id, NULL AS tool_name,
+             1 AS occurrences
+           FROM messages m
+           JOIN sessions s ON s.session_id = m.session_id
+
+           UNION ALL
+
+           SELECT
+             s.session_id, s.thread_name, s.cwd, s.updated_at, s.archive_scope,
+             i.sequence, i.timestamp, 'published_task_retrieval' AS source_type,
+             NULL AS role, i.task_text AS searchable_text,
+             i.token, i.call_id, i.tool_name, grouped.occurrences
+           FROM session_task_inputs i
+           JOIN (
+             SELECT session_id, token, MAX(sequence) AS sequence, COUNT(*) AS occurrences
+             FROM session_task_inputs
+             GROUP BY session_id, token
+           ) grouped
+             ON grouped.session_id = i.session_id
+            AND grouped.token = i.token
+            AND grouped.sequence = i.sequence
+           JOIN sessions s ON s.session_id = i.session_id
+         )
          WHERE ${where.join(" AND ")}
-         ORDER BY s.archive_scope ASC, s.updated_at DESC, m.sequence DESC
+         ORDER BY archive_scope ASC, updated_at DESC, sequence DESC
          LIMIT 25`
       )
-      .all(...params) as Array<Record<string, unknown> & { content_text: string }>;
+      .all(...params) as FindTextRow[];
 
     if (rows.length === 0) {
-      return { status: "not_found", error: "no message matched the provided text" };
+      return { status: "not_found", error: "no message or published task retrieval matched the provided text" };
     }
     if (rows.length !== 1) {
       const response: Record<string, unknown> = {
         status: "ambiguous",
-        error: "text matched multiple messages; provide a longer, more distinctive original snippet",
+        error: "text matched multiple messages or published task retrievals; provide a longer, more distinctive original snippet",
         match_count: rows.length
       };
       if (args.include_candidates) {
@@ -219,15 +257,22 @@ export class CodexSessionQueries {
           thread_name: row.thread_name,
           updated_at: row.updated_at,
           archive_scope: row.archive_scope,
-          sequence: row.sequence,
-          role: row.role,
-          snippet: makeSnippet(row.content_text, text, args.max_chars ?? 500)
+          ...findTextMatch(row, text, args.max_chars ?? 500)
         }));
       }
       return response;
     }
 
     const row = rows[0];
+    const match = findTextMatch(row, text, args.max_chars ?? 500);
+    const legacyMessage = row.source_type === "message"
+      ? {
+          sequence: row.sequence,
+          timestamp: row.timestamp,
+          role: row.role,
+          snippet: match.snippet
+        }
+      : undefined;
     return {
       status: "ok",
       data: {
@@ -236,12 +281,8 @@ export class CodexSessionQueries {
         cwd: row.cwd,
         updated_at: row.updated_at,
         archive_scope: row.archive_scope,
-        message: {
-          sequence: row.sequence,
-          timestamp: row.timestamp,
-          role: row.role,
-          snippet: makeSnippet(row.content_text, text, args.max_chars ?? 500)
-        }
+        match,
+        ...(legacyMessage ? { message: legacyMessage } : {})
       }
     };
   }
@@ -340,11 +381,11 @@ export class CodexSessionQueries {
     const taskRawSelect = includeRaw ? "task_raw.raw_json" : "NULL";
     const rows = this.db
       .prepare(
-        `SELECT sequence, timestamp, input_type, role, content_text, content_json,
+        `SELECT sequence, timestamp, input_type, role, content_text,
                 token, task_text, call_id, tool_name, raw_json
          FROM (
            SELECT m.sequence, m.timestamp, 'user_message' AS input_type,
-                  m.role, m.content_text, m.content_json,
+                  m.role, m.content_text,
                   NULL AS token, NULL AS task_text, NULL AS call_id, NULL AS tool_name,
                   ${userRawSelect} AS raw_json
            FROM messages m
@@ -354,7 +395,7 @@ export class CodexSessionQueries {
            UNION ALL
 
            SELECT i.sequence, i.timestamp, 'published_task_retrieval' AS input_type,
-                  NULL AS role, NULL AS content_text, NULL AS content_json,
+                  NULL AS role, NULL AS content_text,
                   i.token, i.task_text, i.call_id, i.tool_name,
                   ${taskRawSelect} AS raw_json
            FROM session_task_inputs i
@@ -370,7 +411,6 @@ export class CodexSessionQueries {
         input_type: "user_message" | "published_task_retrieval";
         role: string | null;
         content_text: string | null;
-        content_json: string | null;
         token: string | null;
         task_text: string | null;
         call_id: string | null;
@@ -398,7 +438,6 @@ export class CodexSessionQueries {
         ...common,
         role: row.role,
         content_text: truncateText(row.content_text, maxChars),
-        content_json: row.content_json,
         ...(includeRaw ? { raw_json: row.raw_json } : {})
       };
     });
@@ -757,6 +796,29 @@ function addArchiveScope(where: string[], params: unknown[], archiveScope: Archi
 function matchesMode(matched: string[], keywords: string[], match: KeywordMatch): boolean {
   if (match === "all") return matched.length === keywords.length;
   return matched.length > 0;
+}
+
+function findTextMatch(row: FindTextRow, text: string, maxChars: number): Record<string, unknown> & { snippet: string } {
+  const common = {
+    input_type: row.source_type === "published_task_retrieval"
+      ? "published_task_retrieval"
+      : row.role === "user"
+        ? "user_message"
+        : "message",
+    sequence: row.sequence,
+    timestamp: row.timestamp,
+    snippet: makeSnippet(row.searchable_text, text, maxChars)
+  };
+  if (row.source_type === "published_task_retrieval") {
+    return {
+      ...common,
+      token: row.token,
+      call_id: row.call_id,
+      tool_name: row.tool_name,
+      occurrences: row.occurrences
+    };
+  }
+  return { ...common, role: row.role };
 }
 
 function effectiveLength(text: string): number {

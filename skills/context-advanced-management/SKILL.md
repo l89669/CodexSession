@@ -21,7 +21,7 @@ Use the `codex_session_*` MCP tools as a local transcript and delegated-task dat
 2. If the current `session_id` is already known, use it directly.
 3. If the current `session_id` is unknown and the session is still active, call `codex_session_get_session_token`, then call `codex_session_get_session_by_token` with the returned `token`.
 4. If token lookup returns `pending`, retry once after a short delay. If it still cannot locate the session, say that the current session is not indexed yet instead of guessing.
-5. Use `codex_session_find_by_text` only as a fallback for older sessions or when token lookup is unavailable. Prefer a distinctive original snippet of 20-300 characters. If it returns `ambiguous` or `not_found`, use a better snippet or ask for a narrower time/session clue.
+5. Use `codex_session_find_by_text` only as a fallback for older sessions or when token lookup is unavailable. It searches ordinary messages, published task text, and published task tokens; inspect the returned `input_type` to distinguish `published_task_retrieval` from messages. Prefer a distinctive original snippet of 20-300 characters. If it returns `ambiguous` or `not_found`, use a better snippet or ask for a narrower time/session clue.
 6. After locating the right session, choose the narrowest useful query:
    - latest inputs: `codex_session_recent_user_inputs` with a small `limit`. Read `data.inputs` from newest to oldest:
      - `input_type: user_message` is an ordinary user message. Its text is in `content_text`.

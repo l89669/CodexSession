@@ -79,6 +79,7 @@ test("supports the compression recovery workflow for this MCP task", async () =>
   });
   assert.equal(located.status, "ok");
   assert.equal((located.data as any).session_id, sessionId);
+  assert.equal((located.data as any).match.input_type, "user_message");
 
   const recent = await queries.recentUserInputs({ session_id: sessionId, limit: 3 });
   assert.equal(recent.status, "ok");
@@ -229,9 +230,76 @@ test("recent user inputs exposes get_task results as typed task retrievals", asy
   assert.equal("role" in inputs[1], false);
   assert.equal("content_text" in inputs[1], false);
   assert.equal("task" in inputs[0], false);
+  assert.equal(inputs.some((input: any) => "content_json" in input), false);
+
+  const recentWithRaw = await queries.recentUserInputs({
+    session_id: sessionId,
+    limit: 1,
+    max_chars: 20,
+    include_raw: true
+  });
+  const rawInput = (recentWithRaw.data as any).inputs[0];
+  assert.equal(rawInput.content_text, truncateText("ordinary input after task", 20));
+  assert.equal(typeof rawInput.raw_json, "string");
+  assert.equal("content_json" in rawInput, false);
 
   const indexed = db.prepare("SELECT token, task_text FROM session_task_inputs WHERE session_id = ?").get(sessionId);
   assert.deepEqual(indexed, { token, task_text: task });
+
+  const locatedByTask = await queries.findByText({
+    text: "Preserve **Markdown** exactly",
+    archive_scope: "active",
+    max_chars: 80
+  });
+  assert.equal(locatedByTask.status, "ok");
+  assert.equal((locatedByTask.data as any).session_id, sessionId);
+  assert.deepEqual(
+    {
+      input_type: (locatedByTask.data as any).match.input_type,
+      sequence: (locatedByTask.data as any).match.sequence,
+      token: (locatedByTask.data as any).match.token,
+      call_id: (locatedByTask.data as any).match.call_id,
+      tool_name: (locatedByTask.data as any).match.tool_name
+    },
+    {
+      input_type: "published_task_retrieval",
+      sequence: 3,
+      token,
+      call_id: `${sessionId}-get-task`,
+      tool_name: "codex_session_get_task"
+    }
+  );
+  assert.match((locatedByTask.data as any).match.snippet, /Preserve \*\*Markdown\*\* exactly/);
+  assert.equal("message" in (locatedByTask.data as any), false);
+
+  const locatedByToken = await queries.findByText({ text: token, archive_scope: "active" });
+  assert.equal(locatedByToken.status, "ok");
+  assert.equal((locatedByToken.data as any).session_id, sessionId);
+  assert.equal((locatedByToken.data as any).match.input_type, "published_task_retrieval");
+  assert.equal((locatedByToken.data as any).match.token, token);
+});
+
+test("find_by_text collapses repeated retrievals of the same published task", async () => {
+  const env = createFixtureHome();
+  const sessionId = "repeated-task-input-session";
+  const token = "22222222-2222-4222-8222-222222222222";
+  const task = "Repeatable delegated instruction with one distinctive recovery phrase.";
+  writeTaskInputSession(path.join(env.activeDir, "repeated-task-input.jsonl"), sessionId, token, task, true);
+
+  const { queries, indexer } = openFixture(env.codexHome, env.dbPath);
+  await indexer.sync({ rebuild: true, force: true });
+
+  for (const text of ["one distinctive recovery phrase", token]) {
+    const located = await queries.findByText({ text, archive_scope: "active" });
+    assert.equal(located.status, "ok");
+    assert.equal((located.data as any).session_id, sessionId);
+    assert.equal((located.data as any).match.input_type, "published_task_retrieval");
+    assert.equal((located.data as any).match.token, token);
+    assert.equal((located.data as any).match.occurrences, 2);
+    assert.equal((located.data as any).match.sequence, 5);
+    assert.equal((located.data as any).match.call_id, `${sessionId}-get-task-repeat`);
+    assert.equal("message" in (located.data as any), false);
+  }
 });
 
 test("archive_scope isolates active and archived sessions and deletion follows disk state", async () => {
@@ -600,8 +668,8 @@ function writeLocatorTokenSession(filePath: string, sessionId: string, token: st
   fs.writeFileSync(filePath, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`, "utf8");
 }
 
-function writeTaskInputSession(filePath: string, sessionId: string, token: string, task: string): void {
-  const lines = [
+function writeTaskInputSession(filePath: string, sessionId: string, token: string, task: string, repeatTask = false): void {
+  const lines: any[] = [
     {
       timestamp: "2026-06-07T00:00:00.000Z",
       type: "session_meta",
@@ -636,6 +704,26 @@ function writeTaskInputSession(filePath: string, sessionId: string, token: strin
       payload: { type: "message", role: "user", content: [{ type: "input_text", text: "ordinary input after task" }] }
     }
   ];
+  if (repeatTask) {
+    lines.push({
+      timestamp: "2026-06-07T00:00:04.000Z",
+      type: "event_msg",
+      payload: {
+        type: "mcp_tool_call_end",
+        call_id: `${sessionId}-get-task-repeat`,
+        invocation: {
+          server: "codex_session_context",
+          tool: "codex_session_get_task",
+          arguments: { token }
+        },
+        result: {
+          Ok: {
+            content: [{ type: "text", text: JSON.stringify({ status: "ok", data: { token, task } }) }]
+          }
+        }
+      }
+    });
+  }
   fs.writeFileSync(filePath, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`, "utf8");
 }
 
