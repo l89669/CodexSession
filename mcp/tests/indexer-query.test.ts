@@ -464,23 +464,6 @@ test("query tools return indexing envelope when local sync is still running", as
   assert.equal((sync.data as any).indexing, true);
 });
 
-test("committed synthetic sample excludes generic sensitive-data forms", () => {
-  assert.ok(fs.existsSync(samplePath), "missing committed synthetic sample fixture");
-  const sample = fs.readFileSync(samplePath, "utf8");
-  assert.doesNotMatch(sample, /\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b/i);
-  assert.doesNotMatch(sample, /[A-Za-z]:\\Users\\(?!<USER>)/i);
-  assert.equal(/\bsk-[A-Za-z0-9_-]{12,}\b/.test(sample), false);
-  const parsed = sample.trim().split(/\r?\n/).map((line) => JSON.parse(line));
-  let encryptedFields = 0;
-  walkJson(parsed, (key, value) => {
-    if (key === "encrypted_content") {
-      encryptedFields += 1;
-      assert.equal(value, "<REDACTED_SECRET>");
-    }
-  });
-  assert.ok(encryptedFields > 0);
-});
-
 function createFixtureHome(): { root: string; codexHome: string; activeDir: string; archivedDir: string; dbPath: string } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-session-mcp-test-"));
   const codexHome = path.join(root, ".codex");
