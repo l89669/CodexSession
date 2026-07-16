@@ -10,6 +10,26 @@ import { ArchiveScope, IndexingStatus, SessionFile, SyncResult } from "./types.j
 import { ensureDir, listJsonlFiles, nowIso } from "./util.js";
 import { LeaderLease } from "./leader.js";
 
+interface IndexerScheduler {
+  setInterval(callback: () => void, delayMs: number): NodeJS.Timeout;
+  clearInterval(timer: NodeJS.Timeout): void;
+}
+
+interface CodexSessionIndexerOptions {
+  holderId?: string;
+  leaseMs?: number;
+  runSyncInProcess?: boolean;
+  syncCheckIntervalMs?: number;
+  leaderRenewIntervalMs?: number;
+  nowMs?: () => number;
+  scheduler?: IndexerScheduler;
+}
+
+const systemScheduler: IndexerScheduler = {
+  setInterval: (callback, delayMs) => setInterval(callback, delayMs),
+  clearInterval: (timer) => clearInterval(timer)
+};
+
 export class CodexSessionIndexer {
   private readonly db: Db;
   private readonly paths: RuntimePaths;
@@ -17,6 +37,8 @@ export class CodexSessionIndexer {
   private readonly runSyncInProcess: boolean;
   private readonly syncCheckIntervalMs: number;
   private readonly leaderRenewIntervalMs: number;
+  private readonly nowMs: () => number;
+  private readonly scheduler: IndexerScheduler;
   private watcher: FSWatcher | undefined;
   private syncPromise: Promise<SyncResult> | undefined;
   private activeWorker: Worker | undefined;
@@ -30,13 +52,7 @@ export class CodexSessionIndexer {
   constructor(
     db: Db,
     paths: RuntimePaths,
-    options: {
-      holderId?: string;
-      leaseMs?: number;
-      runSyncInProcess?: boolean;
-      syncCheckIntervalMs?: number;
-      leaderRenewIntervalMs?: number;
-    } = {}
+    options: CodexSessionIndexerOptions = {}
   ) {
     this.db = db;
     this.paths = paths;
@@ -44,6 +60,8 @@ export class CodexSessionIndexer {
     this.runSyncInProcess = Boolean(options.runSyncInProcess);
     this.syncCheckIntervalMs = options.syncCheckIntervalMs ?? 5_000;
     this.leaderRenewIntervalMs = options.leaderRenewIntervalMs ?? 5_000;
+    this.nowMs = options.nowMs ?? Date.now;
+    this.scheduler = options.scheduler ?? systemScheduler;
   }
 
   get holderId(): string {
@@ -52,13 +70,13 @@ export class CodexSessionIndexer {
 
   start(): void {
     this.tryBecomeLeader();
-    this.leaderTimer = setInterval(() => {
+    this.leaderTimer = this.scheduler.setInterval(() => {
       this.tryBecomeLeader();
     }, this.leaderRenewIntervalMs);
   }
 
   async stop(): Promise<void> {
-    if (this.leaderTimer) clearInterval(this.leaderTimer);
+    if (this.leaderTimer) this.scheduler.clearInterval(this.leaderTimer);
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     if (this.watcher) await this.watcher.close();
     const runningSync = this.syncPromise;
@@ -137,7 +155,7 @@ export class CodexSessionIndexer {
   }
 
   async sync(options: { rebuild?: boolean; force?: boolean } = {}): Promise<SyncResult> {
-    this.lastSyncCheckMs = Date.now();
+    this.lastSyncCheckMs = this.nowMs();
     let canWrite: boolean;
     try {
       canWrite = this.lease.isLeader() || this.lease.acquireOrRenew();
@@ -152,14 +170,14 @@ export class CodexSessionIndexer {
     }
     if (this.syncPromise) return this.syncPromise;
     this.syncPromise = this.runSyncInBackground(options).finally(() => {
-      this.lastSyncCheckMs = Date.now();
+      this.lastSyncCheckMs = this.nowMs();
       this.syncPromise = undefined;
     });
     return this.syncPromise;
   }
 
   syncIfNeeded(): void {
-    const now = Date.now();
+    const now = this.nowMs();
     if (now - this.lastSyncCheckMs < this.syncCheckIntervalMs) return;
     this.lastSyncCheckMs = now;
     let canWrite: boolean;

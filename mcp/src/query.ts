@@ -15,9 +15,11 @@ import {
   truncateText
 } from "./util.js";
 
+type SessionQueryIndexer = Pick<CodexSessionIndexer, "status" | "sync" | "syncIfNeeded" | "waitForIdle">;
+
 interface QueryContext {
   db: Db;
-  indexer: CodexSessionIndexer;
+  indexer: SessionQueryIndexer;
   waitForIdleMs?: number;
 }
 
@@ -40,7 +42,7 @@ interface FindTextRow {
 
 export class CodexSessionQueries {
   private readonly db: Db;
-  private readonly indexer: CodexSessionIndexer;
+  private readonly indexer: SessionQueryIndexer;
   private readonly waitForIdleMs: number;
 
   constructor(context: QueryContext) {
