@@ -1,0 +1,6 @@
+{"timestamp":"2026-06-07T10:00:00.000Z","type":"session_meta","payload":{"id":"sample-session-001","timestamp":"2026-06-07T10:00:00.000Z","cwd":"C:\\Users\\<USER>\\sample-project","originator":"codex_cli_rs","cli_version":"0.0.0-sample","source":"synthetic","encrypted_content":"<REDACTED_SECRET>"}}
+{"timestamp":"2026-06-07T10:01:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"PLEASE IMPLEMENT THIS PLAN: 请记住这个 synthetic session 只用于工具查询测试，不包含真实用户聊天内容。"}]}}
+{"timestamp":"2026-06-07T10:02:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"我会索引合成样例并检查工具调用。"}]}}
+{"timestamp":"2026-06-07T10:03:00.000Z","type":"response_item","payload":{"type":"function_call","name":"functions.shell_command","arguments":"{\"command\":\"node --version\"}","call_id":"sample-call-001"}}
+{"timestamp":"2026-06-07T10:03:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"sample-call-001","output":"v22.0.0\nsample output only"}}
+{"timestamp":"2026-06-07T10:04:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"请查询 session 周围消息，确认工具输出可以被找到。"}]}}

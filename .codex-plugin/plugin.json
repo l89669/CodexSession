@@ -1,0 +1,35 @@
+{
+  "name": "codex-session-context",
+  "version": "0.1.0+codex.20260715155628",
+  "description": "Keep an agent's effective inputs recoverable across context compression and parent-to-child task handoff.",
+  "author": {
+    "name": "l89669"
+  },
+  "homepage": "https://github.com/l89669/CodexSession",
+  "repository": "https://github.com/l89669/CodexSession",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "context-recovery",
+    "session-history",
+    "sub-agent",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Session Context",
+    "shortDescription": "Keep agent inputs recoverable across context boundaries.",
+    "longDescription": "Preserves an agent's effective inputs across context boundaries. It reconstructs working context after compression from local Codex session history. For parent-to-child handoff, the parent publishes a complete task and the child retrieves it as agent input, which then remains available through the same session recovery workflow.",
+    "developerName": "l89669",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Recover this agent's working context after compression.",
+      "Publish a complete task input for a sub-agent."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

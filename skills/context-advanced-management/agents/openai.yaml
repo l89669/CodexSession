@@ -1,0 +1,4 @@
+interface:
+  display_name: "Context Advanced Management"
+  short_description: "Keep agent inputs recoverable across context boundaries."
+  default_prompt: "Recover this agent's relevant working input from Codex session history."

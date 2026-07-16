@@ -1,0 +1,46 @@
+{
+  "name": "codex-session-mcp",
+  "version": "0.1.0",
+  "description": "Read-only MCP server for indexing local Codex session JSONL files and retrieving exact prior conversation context.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/src/server.js",
+  "types": "./dist/src/server.d.ts",
+  "bin": {
+    "codex-session-mcp": "./dist/src/server.js"
+  },
+  "files": [
+    "dist/",
+    "src/",
+    "scripts/",
+    "samples/",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/l89669/CodexSession.git"
+  },
+  "bugs": {
+    "url": "https://github.com/l89669/CodexSession/issues"
+  },
+  "homepage": "https://github.com/l89669/CodexSession#readme",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/tests/*.test.js",
+    "simulate:mcp": "npm run build && node dist/scripts/simulate-mcp.js",
+    "smoke:real": "npm run build && node dist/scripts/real-codex-home-smoke.js",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.2",
+    "better-sqlite3": "^12.10.0",
+    "chokidar": "^4.0.3",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.15.3",
+    "typescript": "^5.9.3"
+  }
+}

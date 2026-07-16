@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "codex_session_context": {
+      "command": "node",
+      "args": [
+        "./mcp/dist/src/server.js"
+      ],
+      "cwd": ".",
+      "startup_timeout_sec": 20
+    }
+  }
+}
