@@ -157,7 +157,7 @@ export async function createServer(options: { codexHome?: string; indexDbPath?: 
       limit: z.number().int().positive().max(100).optional(),
       include_raw: z.boolean().optional(),
       max_chars: z.number().int().positive().max(100000).optional()
-        .describe("Maximum characters returned for each user message or published task text.")
+        .describe("Maximum characters returned for each ordinary user message or published task text. Persistent recommended_plugins and AGENTS.md system inputs are always collapsed to fixed identifying prefixes.")
     }
   }, async (args) => queries.recentUserInputs(args));
 

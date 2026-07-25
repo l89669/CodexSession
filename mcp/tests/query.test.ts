@@ -234,6 +234,39 @@ test("recent user inputs merge task retrievals without masquerading as messages"
   assert.equal(typeof rawInput.raw_json, "string");
 });
 
+test("recent user inputs collapse persistent system prompts", async (t) => {
+  const env = createFixtureHome(t);
+  const cases = [
+    {
+      sessionId: "recommended-plugins-session",
+      prefix: "<recommended_plugins>\nHere is a list of plugins that are available but not installed.",
+      omittedTail: "\n\n- Connector Alpha\n- Connector Beta\n</recommended_plugins>"
+    },
+    {
+      sessionId: "agents-instructions-session",
+      prefix: "# AGENTS.md instructions",
+      omittedTail: " for C:\\workspace\n\n<INSTRUCTIONS>\nProject rules\n</INSTRUCTIONS>"
+    }
+  ];
+  for (const item of cases) {
+    writeMiniSession(path.join(env.activeDir, `${item.sessionId}.jsonl`), item.sessionId, `${item.prefix}${item.omittedTail}`);
+  }
+  const { queries, indexer } = openFixture(env);
+  await indexer.sync({ rebuild: true, force: true });
+
+  for (const item of cases) {
+    const shortLimit = await queries.recentUserInputs({ session_id: item.sessionId, limit: 1, max_chars: 1 });
+    const longLimit = await queries.recentUserInputs({ session_id: item.sessionId, limit: 1, max_chars: 100_000 });
+    const shortText = (shortLimit.data as any).inputs[0].content_text as string;
+    const longText = (longLimit.data as any).inputs[0].content_text as string;
+
+    assert.equal(shortText, longText);
+    assert.equal(shortText.startsWith(item.prefix), true);
+    assert.equal(shortText.includes(item.omittedTail), false);
+    assert.equal(shortText.length > item.prefix.length, true);
+  }
+});
+
 test("find_by_text locates published tasks by text and token", async (t) => {
   const env = createFixtureHome(t);
   const sessionId = "task-search-session";

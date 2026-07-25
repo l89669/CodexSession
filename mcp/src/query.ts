@@ -23,6 +23,13 @@ interface QueryContext {
   waitForIdleMs?: number;
 }
 
+const PERSISTENT_SYSTEM_INPUT_PREFIXES = [
+  "<recommended_plugins>\nHere is a list of plugins that are available but not installed.",
+  "# AGENTS.md instructions"
+] as const;
+const PERSISTENT_SYSTEM_INPUT_TRUNCATION_NOTICE =
+  "\n... [truncated: this system prompt is guaranteed to remain in context across compression]";
+
 interface FindTextRow {
   session_id: string;
   thread_name: string | null;
@@ -439,7 +446,7 @@ export class CodexSessionQueries {
       return {
         ...common,
         role: row.role,
-        content_text: truncateText(row.content_text, maxChars),
+        content_text: formatRecentUserInput(row.content_text, maxChars),
         ...(includeRaw ? { raw_json: row.raw_json } : {})
       };
     });
@@ -825,6 +832,14 @@ function findTextMatch(row: FindTextRow, text: string, maxChars: number): Record
 
 function effectiveLength(text: string): number {
   return text.replace(/\s+/g, "").length;
+}
+
+function formatRecentUserInput(value: string | null, maxChars: number): string {
+  const persistentPrefix = PERSISTENT_SYSTEM_INPUT_PREFIXES.find((prefix) => value?.startsWith(prefix));
+  if (persistentPrefix) {
+    return `${persistentPrefix}${PERSISTENT_SYSTEM_INPUT_TRUNCATION_NOTICE}`;
+  }
+  return truncateText(value, maxChars);
 }
 
 function makeSnippet(text: string, query: string, maxChars: number): string {

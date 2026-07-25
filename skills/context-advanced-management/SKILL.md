@@ -38,5 +38,5 @@ Use the `codex_session_*` MCP tools as a local transcript and delegated-task dat
 - When the user gives a clear, narrow instruction, answer that instruction directly after retrieval. Do not add a full project-status report or implementation commentary unless asked.
 - Do not use archived sessions unless the task explicitly needs them; default `archive_scope` is `active`.
 - Do not request raw JSON unless schema/debugging detail is needed.
-- Keep result sizes bounded with `limit` and `max_chars`. For `codex_session_recent_user_inputs`, `max_chars` limits both `content_text` and `task`; set it high enough when the complete delegated task is required.
+- Keep result sizes bounded with `limit` and `max_chars`. For `codex_session_recent_user_inputs`, `max_chars` limits ordinary user messages and published tasks; persistent `recommended_plugins` and `AGENTS.md instructions` system inputs are always collapsed to identifying prefixes because compression cannot remove them.
 - If multiple matches appear during session location, consider the locator failed and use a better snippet.
