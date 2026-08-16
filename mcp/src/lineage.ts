@@ -94,7 +94,7 @@ function activeTurnsAt(events: ParsedRawEvent[], maxSequence: number): TurnRange
       byId.set(turnId, turn);
       continue;
     }
-    if (event.payloadType === "task_complete") {
+    if (event.payloadType === "task_complete" || event.payloadType === "turn_aborted") {
       const turnId = stringValue(event.payload.turn_id);
       const turn = turnId ? byId.get(turnId) : active.at(-1);
       if (turn) turn.endSequence = event.sequence;

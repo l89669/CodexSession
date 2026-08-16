@@ -241,7 +241,9 @@ export class CodexSessionQueries {
              NULL AS token, NULL AS call_id, NULL AS tool_name,
              1 AS occurrences
            FROM messages m
+           LEFT JOIN session_turns message_turn ON message_turn.id = m.turn_ref
            JOIN sessions s ON s.session_id = m.session_id
+           WHERE m.turn_ref IS NULL OR message_turn.rewound = 0
 
            UNION ALL
 
@@ -252,9 +254,12 @@ export class CodexSessionQueries {
              i.token, i.call_id, i.tool_name, grouped.occurrences
            FROM session_task_inputs i
            JOIN (
-             SELECT session_id, token, MAX(sequence) AS sequence, COUNT(*) AS occurrences
-             FROM session_task_inputs
-             GROUP BY session_id, token
+             SELECT active_input.session_id, active_input.token,
+                    MAX(active_input.sequence) AS sequence, COUNT(*) AS occurrences
+             FROM session_task_inputs active_input
+             LEFT JOIN session_turns input_turn ON input_turn.id = active_input.turn_ref
+             WHERE active_input.turn_ref IS NULL OR input_turn.rewound = 0
+             GROUP BY active_input.session_id, active_input.token
            ) grouped
              ON grouped.session_id = i.session_id
             AND grouped.token = i.token
@@ -336,7 +341,11 @@ export class CodexSessionQueries {
     const view = resolveSessionHistory(this.db, args.session_id);
     let rows: MessageQueryRow[] = view.segments.flatMap((segment) => {
       const params: unknown[] = [segment.sessionId, segment.minSequence];
-      const where = ["m.session_id = ?", "m.sequence >= ?"];
+      const where = [
+        "m.session_id = ?",
+        "m.sequence >= ?",
+        "(m.turn_ref IS NULL OR message_turn.rewound = 0)"
+      ];
       if (segment.maxSequence !== null) {
         where.push("m.sequence <= ?");
         params.push(segment.maxSequence);
@@ -359,6 +368,7 @@ export class CodexSessionQueries {
         .prepare(
           `SELECT m.sequence, m.timestamp, m.role, m.content_text, m.content_json${rawSelect}
            FROM messages m
+           LEFT JOIN session_turns message_turn ON message_turn.id = m.turn_ref
            ${rawJoin}
            WHERE ${where.join(" AND ")}`
         )
@@ -427,8 +437,10 @@ export class CodexSessionQueries {
                   NULL AS token, NULL AS task_text, NULL AS call_id, NULL AS tool_name,
                   ${userRawSelect} AS raw_json
            FROM messages m
+           LEFT JOIN session_turns user_turn ON user_turn.id = m.turn_ref
            ${userRawJoin}
-           WHERE m.session_id = ? AND m.sequence >= ? ${range} AND m.role = 'user'`
+           WHERE m.session_id = ? AND m.sequence >= ? ${range} AND m.role = 'user'
+             AND (m.turn_ref IS NULL OR user_turn.rewound = 0)`
         )
         .all(...userParams) as Array<Record<string, unknown> & { sequence: number }>;
       const taskRows = this.db
@@ -438,8 +450,10 @@ export class CodexSessionQueries {
                   i.token, i.task_text, i.call_id, i.tool_name,
                   ${taskRawSelect} AS raw_json
            FROM session_task_inputs i
+           LEFT JOIN session_turns task_turn ON task_turn.id = i.turn_ref
            ${taskRawJoin}
-           WHERE i.session_id = ? AND i.sequence >= ? ${taskRange}`
+           WHERE i.session_id = ? AND i.sequence >= ? ${taskRange}
+             AND (i.turn_ref IS NULL OR task_turn.rewound = 0)`
         )
         .all(...taskParams) as Array<Record<string, unknown> & { sequence: number }>;
       return [...userRows, ...taskRows].map((row) => ({
@@ -513,7 +527,11 @@ export class CodexSessionQueries {
     const view = resolveSessionHistory(this.db, args.session_id);
     let rows: ToolQueryRow[] = view.segments.flatMap((segment) => {
       const params: unknown[] = [segment.sessionId, segment.minSequence];
-      const where = ["t.session_id = ?", "t.sequence >= ?"];
+      const where = [
+        "t.session_id = ?",
+        "t.sequence >= ?",
+        "(t.turn_ref IS NULL OR tool_turn.rewound = 0)"
+      ];
       if (segment.maxSequence !== null) {
         where.push("t.sequence <= ?");
         params.push(segment.maxSequence);
@@ -547,6 +565,7 @@ export class CodexSessionQueries {
              t.sequence, t.timestamp, t.call_id, t.tool_name, t.arguments_json,
              t.output_sequence, t.output_timestamp, t.output_text, t.output_json${rawSelect}
            FROM tool_calls t
+           LEFT JOIN session_turns tool_turn ON tool_turn.id = t.turn_ref
            ${rawJoin}
            WHERE ${where.join(" AND ")}`
         )
@@ -654,7 +673,11 @@ export class CodexSessionQueries {
     maxChars: number;
   }): Array<Record<string, unknown>> {
     const params: unknown[] = [options.segment.sessionId, options.segment.minSequence];
-    const where = ["m.session_id = ?", "m.sequence >= ?"];
+    const where = [
+      "m.session_id = ?",
+      "m.sequence >= ?",
+      "(m.turn_ref IS NULL OR message_turn.rewound = 0)"
+    ];
     if (options.segment.maxSequence !== null) {
       where.push("m.sequence <= ?");
       params.push(options.segment.maxSequence);
@@ -678,6 +701,7 @@ export class CodexSessionQueries {
       .prepare(
         `SELECT m.sequence, m.timestamp, m.role, m.content_text${rawSelect}
          FROM messages m
+         LEFT JOIN session_turns message_turn ON message_turn.id = m.turn_ref
          ${rawJoin}
          WHERE ${where.join(" AND ")}
          ORDER BY m.sequence ${options.order.toUpperCase()}
@@ -713,7 +737,11 @@ export class CodexSessionQueries {
     maxChars: number;
   }): Array<Record<string, unknown>> {
     const params: unknown[] = [options.segment.sessionId, options.segment.minSequence];
-    const where = ["t.session_id = ?", "t.sequence >= ?"];
+    const where = [
+      "t.session_id = ?",
+      "t.sequence >= ?",
+      "(t.turn_ref IS NULL OR tool_turn.rewound = 0)"
+    ];
     if (options.segment.maxSequence !== null) {
       where.push("t.sequence <= ?");
       params.push(options.segment.maxSequence);
@@ -735,6 +763,7 @@ export class CodexSessionQueries {
       .prepare(
         `SELECT t.sequence, t.timestamp, t.call_id, t.tool_name, t.arguments_json, t.output_text${rawSelect}
          FROM tool_calls t
+         LEFT JOIN session_turns tool_turn ON tool_turn.id = t.turn_ref
          ${rawJoin}
          WHERE ${where.join(" AND ")}
          ORDER BY t.sequence ${options.order.toUpperCase()}

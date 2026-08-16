@@ -148,8 +148,8 @@ test("a legacy index is rebuilt and physically compacted once", async (t) => {
       fileShrank: compactedBytes < legacyBytes
     },
     {
-      userVersion: 6,
-      indexVersion: 2,
+      userVersion: 7,
+      indexVersion: 3,
       rawEventWasRebuilt: true,
       filesIndexed: 1,
       fileShrank: true
@@ -243,6 +243,83 @@ test("fork history is shared at the rollback boundary and later file changes app
     ["appended input", "child input"]
   );
   assert.equal((afterBoundaryChange.data as any).parent_history_status, "boundary_mismatch");
+});
+
+test("rewind hides the completed turn including steer inputs and outputs", async (t) => {
+  const env = createFixtureHome(t);
+  const sessionId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const filePath = path.join(env.activeDir, `rollout-${sessionId}.jsonl`);
+  const taskToken = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  writeLines(filePath, [
+    sessionMetaLine(sessionId, undefined, "2026-06-07T02:00:00.000Z"),
+    eventLine("task_started", { turn_id: "original-turn" }),
+    messageLine("user", "original input"),
+    messageLine("assistant", "first original output"),
+    messageLine("user", "steer input inside original turn"),
+    toolCallLine("original-call"),
+    toolOutputLine("original-call", "original tool output"),
+    taskRetrievalLine(sessionId, taskToken, "task recovered inside original turn"),
+    messageLine("assistant", "final original output"),
+    eventLine("task_complete", { turn_id: "original-turn" })
+  ]);
+
+  const { db, queries, indexer } = openFixture(env);
+  await indexer.sync({ rebuild: true, force: true });
+  const beforeRewind = await queries.recentUserInputs({ session_id: sessionId, limit: 10 });
+  assert.deepEqual(
+    (beforeRewind.data as any).inputs.map((input: any) => input.task ?? input.content_text),
+    ["task recovered inside original turn", "steer input inside original turn", "original input"]
+  );
+
+  appendLines(filePath, [
+    eventLine("thread_rolled_back", { num_turns: 1 }),
+    eventLine("task_started", { turn_id: "replacement-turn" }),
+    messageLine("user", "edited replacement input"),
+    messageLine("assistant", "replacement answer"),
+    eventLine("task_complete", { turn_id: "replacement-turn" }),
+    eventLine("task_started", { turn_id: "aborted-turn" }),
+    messageLine("user", "input in later aborted turn"),
+    messageLine("user", "steer in later aborted turn"),
+    messageLine("assistant", "partial later output"),
+    eventLine("turn_aborted", { turn_id: "aborted-turn" })
+  ]);
+  await indexer.sync();
+
+  const turns = db
+    .prepare("SELECT turn_id, rewound FROM session_turns WHERE session_id = ? ORDER BY start_sequence")
+    .all(sessionId);
+  assert.deepEqual(turns, [
+    { turn_id: "original-turn", rewound: 1 },
+    { turn_id: "replacement-turn", rewound: 0 },
+    { turn_id: "aborted-turn", rewound: 0 }
+  ]);
+
+  const recent = await queries.recentUserInputs({ session_id: sessionId, limit: 10 });
+  assert.deepEqual(
+    (recent.data as any).inputs.map((input: any) => input.task ?? input.content_text),
+    ["steer in later aborted turn", "input in later aborted turn", "edited replacement input"]
+  );
+  const messages = await queries.messages({ session_id: sessionId, order: "asc", limit: 20 });
+  assert.deepEqual(
+    (messages.data as any).messages.map((message: any) => message.content_text),
+    [
+      "edited replacement input",
+      "replacement answer",
+      "input in later aborted turn",
+      "steer in later aborted turn",
+      "partial later output"
+    ]
+  );
+  const toolCalls = await queries.toolCalls({ session_id: sessionId, limit: 10 });
+  assert.deepEqual((toolCalls.data as any).tool_calls, []);
+  const oldTask = await queries.findByText({ text: "task recovered inside original turn" });
+  assert.equal(oldTask.status, "not_found");
+  const raw = await queries.keywordSearch({
+    session_id: sessionId,
+    query: "steer input inside original turn",
+    scope: "raw_events"
+  });
+  assert.equal((raw.data as any).results.length, 1);
 });
 
 test("archive scope follows session file moves and deletions", async (t) => {
@@ -381,6 +458,54 @@ function messageLine(role: "user" | "assistant", text: string): Record<string, u
       type: "message",
       role,
       content: [{ type: role === "user" ? "input_text" : "output_text", text }]
+    }
+  };
+}
+
+function toolCallLine(callId: string): Record<string, unknown> {
+  return {
+    timestamp: "2026-06-07T01:00:00.003Z",
+    type: "response_item",
+    payload: {
+      type: "function_call",
+      name: "functions.shell_command",
+      arguments: "{\"command\":\"date\"}",
+      call_id: callId
+    }
+  };
+}
+
+function toolOutputLine(callId: string, output: string): Record<string, unknown> {
+  return {
+    timestamp: "2026-06-07T01:00:00.003Z",
+    type: "response_item",
+    payload: { type: "function_call_output", call_id: callId, output }
+  };
+}
+
+function taskRetrievalLine(
+  sessionId: string,
+  token: string,
+  task: string
+): Record<string, unknown> {
+  return {
+    timestamp: "2026-06-07T01:00:00.003Z",
+    type: "event_msg",
+    payload: {
+      type: "mcp_tool_call_end",
+      call_id: `${sessionId}-task-retrieval`,
+      invocation: {
+        server: "codex_session_context",
+        tool: "codex_session_get_task",
+        arguments: { token }
+      },
+      result: {
+        Ok: {
+          content: [
+            { type: "text", text: JSON.stringify({ status: "ok", data: { token, task } }) }
+          ]
+        }
+      }
     }
   };
 }

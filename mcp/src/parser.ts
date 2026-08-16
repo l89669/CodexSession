@@ -152,7 +152,12 @@ export function parseSessionChunk(
     };
     rawEvents.push(raw);
     const finish = () => {
-      if (eventType === "event_msg" && payloadType === "task_complete") currentTurnId = null;
+      if (
+        eventType === "event_msg" &&
+        (payloadType === "task_complete" || payloadType === "turn_aborted")
+      ) {
+        currentTurnId = null;
+      }
       indexedLength = consumedEnd;
     };
 

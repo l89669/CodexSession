@@ -4,6 +4,8 @@ import path from "node:path";
 
 export type Db = Database.Database;
 
+export const INDEX_SCHEMA_VERSION = 7;
+
 export function openDatabase(dbPath: string, options: { busyTimeoutMs?: number } = {}): Db {
   ensureDir(path.dirname(dbPath));
   const busyTimeoutMs = options.busyTimeoutMs ?? 5_000;
@@ -77,6 +79,17 @@ export function migrate(db: Db): void {
       FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS session_turns (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      start_sequence INTEGER NOT NULL,
+      end_sequence INTEGER,
+      rewound INTEGER NOT NULL DEFAULT 0 CHECK (rewound IN (0, 1)),
+      UNIQUE (session_id, turn_id),
+      FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
@@ -85,8 +98,10 @@ export function migrate(db: Db): void {
       role TEXT NOT NULL,
       content_text TEXT NOT NULL,
       content_json TEXT,
+      turn_ref INTEGER,
       raw_event_id INTEGER NOT NULL,
       FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+      FOREIGN KEY (turn_ref) REFERENCES session_turns(id) ON DELETE CASCADE,
       FOREIGN KEY (raw_event_id) REFERENCES raw_events(id) ON DELETE CASCADE
     );
 
@@ -102,9 +117,11 @@ export function migrate(db: Db): void {
       output_timestamp TEXT,
       output_text TEXT,
       output_json TEXT,
+      turn_ref INTEGER,
       call_raw_event_id INTEGER NOT NULL,
       output_raw_event_id INTEGER,
       FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+      FOREIGN KEY (turn_ref) REFERENCES session_turns(id) ON DELETE CASCADE,
       FOREIGN KEY (call_raw_event_id) REFERENCES raw_events(id) ON DELETE CASCADE,
       FOREIGN KEY (output_raw_event_id) REFERENCES raw_events(id) ON DELETE SET NULL
     );
@@ -140,9 +157,11 @@ export function migrate(db: Db): void {
       tool_name TEXT NOT NULL,
       token TEXT NOT NULL,
       task_text TEXT NOT NULL,
+      turn_ref INTEGER,
       raw_event_id INTEGER NOT NULL,
       PRIMARY KEY (session_id, sequence),
       FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+      FOREIGN KEY (turn_ref) REFERENCES session_turns(id) ON DELETE CASCADE,
       FOREIGN KEY (raw_event_id) REFERENCES raw_events(id) ON DELETE CASCADE
     );
 
@@ -176,6 +195,7 @@ export function migrate(db: Db): void {
     CREATE INDEX IF NOT EXISTS idx_sessions_archive ON sessions(archive_scope);
     CREATE INDEX IF NOT EXISTS idx_raw_events_session_seq ON raw_events(session_id, sequence);
     CREATE INDEX IF NOT EXISTS idx_raw_events_type ON raw_events(event_type, payload_type);
+    CREATE INDEX IF NOT EXISTS idx_session_turns_session_end ON session_turns(session_id, end_sequence DESC);
     CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, sequence);
     CREATE INDEX IF NOT EXISTS idx_messages_role ON messages(session_id, role);
     CREATE INDEX IF NOT EXISTS idx_messages_raw_event ON messages(raw_event_id);
@@ -213,6 +233,20 @@ export function migrate(db: Db): void {
   if (!columnExists(db, "raw_events", "byte_length")) {
     db.exec("ALTER TABLE raw_events ADD COLUMN byte_length INTEGER;");
   }
+  if (!columnExists(db, "messages", "turn_ref")) {
+    db.exec("ALTER TABLE messages ADD COLUMN turn_ref INTEGER REFERENCES session_turns(id) ON DELETE CASCADE;");
+  }
+  if (!columnExists(db, "tool_calls", "turn_ref")) {
+    db.exec("ALTER TABLE tool_calls ADD COLUMN turn_ref INTEGER REFERENCES session_turns(id) ON DELETE CASCADE;");
+  }
+  if (!columnExists(db, "session_task_inputs", "turn_ref")) {
+    db.exec("ALTER TABLE session_task_inputs ADD COLUMN turn_ref INTEGER REFERENCES session_turns(id) ON DELETE CASCADE;");
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_messages_turn_ref ON messages(turn_ref);
+    CREATE INDEX IF NOT EXISTS idx_tool_calls_turn_ref ON tool_calls(turn_ref);
+    CREATE INDEX IF NOT EXISTS idx_session_task_inputs_turn_ref ON session_task_inputs(turn_ref);
+  `);
   db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_forked_from ON sessions(forked_from_id);");
 
   const version = db.pragma("user_version", { simple: true }) as number;
@@ -233,7 +267,7 @@ export function migrate(db: Db): void {
     db.pragma("user_version = 5");
   }
   if (version === 0) {
-    db.pragma("user_version = 6");
+    db.pragma(`user_version = ${INDEX_SCHEMA_VERSION}`);
   }
 }
 

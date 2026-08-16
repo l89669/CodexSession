@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { watch, FSWatcher } from "chokidar";
-import { Db, deleteFileRows, deleteSessionRows } from "./db.js";
+import { Db, INDEX_SCHEMA_VERSION, deleteFileRows, deleteSessionRows } from "./db.js";
 import { analyzeForkLineage, ForkLineageAnalysis } from "./lineage.js";
 import { RuntimePaths, toPortablePath } from "./paths.js";
 import {
@@ -43,6 +43,8 @@ interface IndexWriteResult {
   messages: number;
   toolCalls: number;
 }
+
+const FILE_INDEX_VERSION = 3;
 
 const systemScheduler: IndexerScheduler = {
   setInterval: (callback, delayMs) => setInterval(callback, delayMs),
@@ -182,7 +184,7 @@ export class CodexSessionIndexer {
 
   private runSync(options: { rebuild?: boolean; force?: boolean }): SyncResult {
     const started = nowIso();
-    const upgradeRebuild = (this.db.pragma("user_version", { simple: true }) as number) < 6;
+    const upgradeRebuild = (this.db.pragma("user_version", { simple: true }) as number) < INDEX_SCHEMA_VERSION;
     const rebuild = Boolean(options.rebuild || upgradeRebuild);
     const result: SyncResult = {
       started_at: started,
@@ -238,7 +240,7 @@ export class CodexSessionIndexer {
         const canAppend =
           !options.force &&
           !rebuild &&
-          known?.index_version === 2 &&
+          known?.index_version === FILE_INDEX_VERSION &&
           known.indexed_bytes !== null &&
           known.boundary_hash !== null &&
           known.indexed_bytes <= file.size &&
@@ -264,7 +266,7 @@ export class CodexSessionIndexer {
         }
       }
       if (upgradeRebuild) {
-        this.db.pragma("user_version = 6");
+        this.db.pragma(`user_version = ${INDEX_SCHEMA_VERSION}`);
       }
       return result;
     } catch (error) {
@@ -343,7 +345,7 @@ export class CodexSessionIndexer {
           `INSERT INTO session_files
            (file_path, session_id, archive_scope, size, mtime_ms, line_count, indexed_bytes,
             boundary_hash, current_turn_id, index_version, indexed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?)`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           file.filePath,
@@ -355,6 +357,7 @@ export class CodexSessionIndexer {
           parsed.indexedBytes,
           boundaryHash(file.filePath, parsed.indexedBytes),
           parsed.currentTurnId,
+          FILE_INDEX_VERSION,
           nowIso()
         );
     });
@@ -386,7 +389,7 @@ export class CodexSessionIndexer {
         .prepare(
           `UPDATE session_files
            SET archive_scope = ?, size = ?, mtime_ms = ?, line_count = ?, indexed_bytes = ?,
-               boundary_hash = ?, current_turn_id = ?, index_version = 2, indexed_at = ?
+               boundary_hash = ?, current_turn_id = ?, index_version = ?, indexed_at = ?
            WHERE file_path = ?`
         )
         .run(
@@ -397,6 +400,7 @@ export class CodexSessionIndexer {
           parsed.indexedBytes,
           boundaryHash(file.filePath, parsed.indexedBytes),
           parsed.currentTurnId,
+          FILE_INDEX_VERSION,
           nowIso(),
           file.filePath
         );
@@ -430,6 +434,7 @@ export class CodexSessionIndexer {
 
   private insertParsedRows(sessionId: string, file: SessionFile, parsed: ParsedSessionChunk): void {
     const rawIdByLine = new Map<number, number>();
+    const turnRefById = new Map<string, number>();
     const rawInsert = this.db.prepare(
       `INSERT INTO raw_events
        (session_id, file_path, line_no, sequence, timestamp, event_type, payload_type, role,
@@ -443,9 +448,42 @@ export class CodexSessionIndexer {
     );
     const taskInputInsert = this.db.prepare(
       `INSERT OR IGNORE INTO session_task_inputs
-       (session_id, sequence, timestamp, call_id, tool_name, token, task_text, raw_event_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+       (session_id, sequence, timestamp, call_id, tool_name, token, task_text, turn_ref, raw_event_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
+    const turnInsert = this.db.prepare(
+      `INSERT OR IGNORE INTO session_turns
+       (session_id, turn_id, start_sequence, end_sequence, rewound)
+       VALUES (?, ?, ?, NULL, 0)`
+    );
+    const turnSelect = this.db.prepare(
+      "SELECT id FROM session_turns WHERE session_id = ? AND turn_id = ?"
+    );
+    const turnClose = this.db.prepare(
+      `UPDATE session_turns
+       SET end_sequence = ?
+       WHERE session_id = ? AND turn_id = ? AND end_sequence IS NULL`
+    );
+    const rewindLastEndedTurn = this.db.prepare(
+      `UPDATE session_turns
+       SET rewound = 1
+       WHERE id = (
+         SELECT id
+         FROM session_turns
+         WHERE session_id = ? AND end_sequence IS NOT NULL
+         ORDER BY end_sequence DESC
+         LIMIT 1
+       ) AND rewound = 0`
+    );
+    const turnRef = (turnId: string | null): number | null => {
+      if (!turnId) return null;
+      const cached = turnRefById.get(turnId);
+      if (cached !== undefined) return cached;
+      const row = turnSelect.get(sessionId, turnId) as { id: number } | undefined;
+      if (!row) return null;
+      turnRefById.set(turnId, row.id);
+      return row.id;
+    };
     for (const raw of parsed.rawEvents) {
       const info = rawInsert.run(
         sessionId,
@@ -462,6 +500,18 @@ export class CodexSessionIndexer {
       );
       const rawEventId = Number(info.lastInsertRowid);
       rawIdByLine.set(raw.lineNo, rawEventId);
+      if (raw.eventType === "event_msg" && raw.payloadType === "task_started" && raw.turnId) {
+        turnInsert.run(sessionId, raw.turnId, raw.sequence);
+        turnRef(raw.turnId);
+      } else if (
+        raw.eventType === "event_msg" &&
+        (raw.payloadType === "task_complete" || raw.payloadType === "turn_aborted") &&
+        raw.turnId
+      ) {
+        turnClose.run(raw.sequence, sessionId, raw.turnId);
+      } else if (raw.eventType === "event_msg" && raw.payloadType === "thread_rolled_back") {
+        rewindLastEndedTurn.run(sessionId);
+      }
       for (const locator of locatorTokensFromMcpToolCallEnd(raw)) {
         locatorInsert.run(
           locator.token,
@@ -486,14 +536,15 @@ export class CodexSessionIndexer {
           taskInput.toolName,
           taskInput.token,
           taskInput.task,
+          turnRef(raw.turnId),
           rawEventId
         );
       }
     }
 
     const messageInsert = this.db.prepare(
-      `INSERT INTO messages (session_id, sequence, timestamp, role, content_text, content_json, raw_event_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO messages (session_id, sequence, timestamp, role, content_text, content_json, turn_ref, raw_event_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     );
     for (const message of parsed.messages) {
       const rawEventId = rawIdByLine.get(message.rawLineNo);
@@ -505,6 +556,7 @@ export class CodexSessionIndexer {
         message.role,
         message.contentText,
         message.contentJson,
+        turnRef(message.turnId),
         rawEventId
       );
     }
@@ -513,8 +565,8 @@ export class CodexSessionIndexer {
     const toolInsert = this.db.prepare(
       `INSERT INTO tool_calls
        (session_id, sequence, timestamp, call_id, tool_name, arguments_json, output_sequence,
-        output_timestamp, output_text, output_json, call_raw_event_id, output_raw_event_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        output_timestamp, output_text, output_json, turn_ref, call_raw_event_id, output_raw_event_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     for (const call of parsed.toolCalls) {
       const callRawEventId = rawIdByLine.get(call.rawLineNo);
@@ -531,6 +583,7 @@ export class CodexSessionIndexer {
         output?.timestamp ?? null,
         output?.outputText ?? null,
         output?.outputJson ?? null,
+        turnRef(call.turnId),
         callRawEventId,
         output ? rawIdByLine.get(output.rawLineNo) ?? null : null
       );
