@@ -109,6 +109,143 @@ test("token lookup incrementally indexes a newly written locator marker", async 
   );
 });
 
+test("a legacy index is rebuilt and physically compacted once", async (t) => {
+  const env = createFixtureHome(t);
+  writeMiniSession(path.join(env.activeDir, "legacy.jsonl"), "legacy-session", "legacy input");
+  const { db, indexer } = openFixture(env);
+  await indexer.sync({ force: true });
+
+  const firstRawEventId = (db
+    .prepare("SELECT MIN(id) AS id FROM raw_events")
+    .get() as { id: number }).id;
+  db.exec(`
+    CREATE TABLE upgrade_ballast (content BLOB);
+    INSERT INTO upgrade_ballast VALUES (zeroblob(8388608));
+    DROP TABLE upgrade_ballast;
+  `);
+  db.pragma("wal_checkpoint(TRUNCATE)");
+  const legacyBytes = fs.statSync(env.dbPath).size;
+  db.pragma("user_version = 5");
+  db.exec(`
+    UPDATE session_files
+    SET index_version = 1,
+        indexed_bytes = NULL,
+        boundary_hash = NULL,
+        current_turn_id = NULL;
+  `);
+  db.exec("DELETE FROM sessions;");
+  const observer = openDatabase(env.dbPath);
+  assert.equal(observer.pragma("user_version", { simple: true }), 5);
+  observer.close();
+
+  const upgraded = await indexer.sync();
+  const compactedBytes = fs.statSync(env.dbPath).size;
+  assert.deepEqual(
+    {
+      userVersion: db.pragma("user_version", { simple: true }),
+      indexVersion: (db.prepare("SELECT index_version FROM session_files").get() as { index_version: number }).index_version,
+      rawEventWasRebuilt: (db.prepare("SELECT MIN(id) AS id FROM raw_events").get() as { id: number }).id > firstRawEventId,
+      filesIndexed: upgraded.files_indexed,
+      fileShrank: compactedBytes < legacyBytes
+    },
+    {
+      userVersion: 6,
+      indexVersion: 2,
+      rawEventWasRebuilt: true,
+      filesIndexed: 1,
+      fileShrank: true
+    }
+  );
+
+  const nextSync = await indexer.sync();
+  assert.equal(nextSync.files_indexed, 0);
+});
+
+test("fork history is shared at the rollback boundary and later file changes append only", async (t) => {
+  const env = createFixtureHome(t);
+  const parentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const childId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const parentFile = path.join(env.activeDir, `rollout-${parentId}.jsonl`);
+  const childFile = path.join(env.activeDir, `rollout-${childId}.jsonl`);
+  const parentLines = forkParentLines(parentId);
+  const childLines = [
+    sessionMetaLine(childId, parentId, "2026-06-07T01:00:00.000Z"),
+    ...parentLines.map((line) => ({ ...line, timestamp: "2026-06-07T01:00:00.001Z" })),
+    eventLine("thread_settings_applied"),
+    eventLine("token_count"),
+    eventLine("thread_rolled_back", { num_turns: 2 }),
+    eventLine("task_started", { turn_id: "child-turn" }),
+    messageLine("user", "child input"),
+    messageLine("assistant", "child answer"),
+    eventLine("task_complete", { turn_id: "child-turn" })
+  ];
+  writeLines(parentFile, parentLines);
+  writeLines(childFile, childLines);
+
+  const { db, queries, indexer } = openFixture(env);
+  await indexer.sync({ rebuild: true, force: true });
+
+  const lineage = db
+    .prepare(
+      `SELECT parent_session_id, replay_parent_sequence, local_start_sequence,
+              parent_cutoff_sequence, boundary_message_sequence
+       FROM session_lineage
+       WHERE session_id = ?`
+    )
+    .get(childId);
+  assert.deepEqual(lineage, {
+    parent_session_id: parentId,
+    replay_parent_sequence: parentLines.length,
+    local_start_sequence: parentLines.length + 2,
+    parent_cutoff_sequence: 5,
+    boundary_message_sequence: 4
+  });
+  assert.equal(
+    (db.prepare("SELECT COUNT(*) AS count FROM raw_events WHERE session_id = ?").get(childId) as { count: number }).count,
+    8
+  );
+
+  const initialInputs = await queries.recentUserInputs({ session_id: childId, limit: 10 });
+  assert.deepEqual(
+    (initialInputs.data as any).inputs.map((input: any) => input.content_text),
+    ["child input", "retained input"]
+  );
+  assert.equal((initialInputs.data as any).parent_history_status, "included");
+
+  const firstChildRawId = (db
+    .prepare("SELECT MIN(id) AS id FROM raw_events WHERE session_id = ?")
+    .get(childId) as { id: number }).id;
+  appendLines(childFile, [
+    eventLine("task_started", { turn_id: "appended-turn" }),
+    messageLine("user", "appended input"),
+    messageLine("assistant", "appended answer"),
+    eventLine("task_complete", { turn_id: "appended-turn" })
+  ]);
+  const appendSync = await indexer.sync();
+  assert.deepEqual(
+    {
+      files_indexed: appendSync.files_indexed,
+      events_indexed: appendSync.events_indexed,
+      firstChildRawId: (db
+        .prepare("SELECT MIN(id) AS id FROM raw_events WHERE session_id = ?")
+        .get(childId) as { id: number }).id
+    },
+    { files_indexed: 1, events_indexed: 4, firstChildRawId }
+  );
+
+  fs.writeFileSync(
+    parentFile,
+    fs.readFileSync(parentFile, "utf8").replace("retained answer", "tampered answer"),
+    "utf8"
+  );
+  const afterBoundaryChange = await queries.recentUserInputs({ session_id: childId, limit: 10 });
+  assert.deepEqual(
+    (afterBoundaryChange.data as any).inputs.map((input: any) => input.content_text),
+    ["appended input", "child input"]
+  );
+  assert.equal((afterBoundaryChange.data as any).parent_history_status, "boundary_mismatch");
+});
+
 test("archive scope follows session file moves and deletions", async (t) => {
   const env = createFixtureHome(t);
   const activeFile = path.join(env.activeDir, "active.jsonl");
@@ -225,4 +362,67 @@ test("query readiness starts at most one sync per check interval", async (t) => 
 
 function runtimePaths(env: { codexHome: string; dbPath: string }): RuntimePaths {
   return resolveRuntimePaths({ codexHome: env.codexHome, indexDbPath: env.dbPath });
+}
+
+function forkParentLines(sessionId: string): Record<string, unknown>[] {
+  return [
+    sessionMetaLine(sessionId, undefined, "2026-06-07T00:00:00.000Z"),
+    eventLine("task_started", { turn_id: "retained-turn" }),
+    messageLine("user", "retained input"),
+    messageLine("assistant", "retained answer"),
+    eventLine("task_complete", { turn_id: "retained-turn" }),
+    eventLine("task_started", { turn_id: "removed-turn-1" }),
+    messageLine("user", "removed input one"),
+    messageLine("assistant", "removed answer one"),
+    eventLine("task_complete", { turn_id: "removed-turn-1" }),
+    eventLine("task_started", { turn_id: "removed-turn-2" }),
+    messageLine("user", "removed input two"),
+    messageLine("assistant", "removed answer two"),
+    eventLine("task_complete", { turn_id: "removed-turn-2" })
+  ];
+}
+
+function sessionMetaLine(
+  sessionId: string,
+  parentSessionId: string | undefined,
+  timestamp: string
+): Record<string, unknown> {
+  return {
+    timestamp,
+    type: "session_meta",
+    payload: {
+      id: sessionId,
+      ...(parentSessionId ? { forked_from_id: parentSessionId } : {}),
+      timestamp,
+      cwd: "C:\\fixture"
+    }
+  };
+}
+
+function eventLine(type: string, payload: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    timestamp: "2026-06-07T01:00:00.002Z",
+    type: "event_msg",
+    payload: { type, ...payload }
+  };
+}
+
+function messageLine(role: "user" | "assistant", text: string): Record<string, unknown> {
+  return {
+    timestamp: "2026-06-07T01:00:00.003Z",
+    type: "response_item",
+    payload: {
+      type: "message",
+      role,
+      content: [{ type: role === "user" ? "input_text" : "output_text", text }]
+    }
+  };
+}
+
+function writeLines(filePath: string, lines: Record<string, unknown>[]): void {
+  fs.writeFileSync(filePath, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`, "utf8");
+}
+
+function appendLines(filePath: string, lines: Record<string, unknown>[]): void {
+  fs.appendFileSync(filePath, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`, "utf8");
 }

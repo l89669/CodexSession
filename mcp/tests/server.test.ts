@@ -114,6 +114,7 @@ test("queries return an indexing envelope without waiting for an active sync", a
   const db = openDatabase(env.dbPath);
   deferDatabase(env, db);
   const neverCompletes = new Promise<SyncResult>(() => undefined);
+  let localIdle = false;
   const status = {
     indexing: true,
     started_at: "2026-06-07T00:00:00.000Z",
@@ -132,13 +133,20 @@ test("queries return an indexing envelope without waiting for an active sync", a
     status: () => status,
     sync: () => neverCompletes,
     syncIfNeeded: () => undefined,
-    waitForIdle: async () => false
+    waitForIdle: async () => localIdle
   };
   const queries = new CodexSessionQueries({ db, indexer, waitForIdleMs: 20 });
 
   const listed = await withTimeout(queries.listSessions({ archive_scope: "active" }), 200, "listSessions should not wait for sync");
+  localIdle = true;
+  const listedFromNonLeader = await withTimeout(
+    queries.listSessions({ archive_scope: "active" }),
+    200,
+    "listSessions should honor another process's active sync"
+  );
   const sync = await withTimeout(queries.sync({}), 200, "sync should return before the request timeout");
   assert.deepEqual(listed, { status: "indexing", data: status });
+  assert.deepEqual(listedFromNonLeader, { status: "indexing", data: status });
   assert.deepEqual(sync, { status: "indexing", data: status });
 });
 

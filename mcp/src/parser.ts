@@ -6,10 +6,13 @@ import { jsonString, normalizeRole, safeJsonParse, textFromContent } from "./uti
 export interface ParsedRawEvent {
   lineNo: number;
   sequence: number;
+  byteStart: number;
+  byteLength: number;
   timestamp: string | null;
   eventType: string;
   payloadType: string | null;
   role: string | null;
+  turnId: string | null;
   rawJson: string;
   parsed: Record<string, unknown>;
   payload: Record<string, unknown>;
@@ -22,6 +25,7 @@ export interface ParsedMessage {
   contentText: string;
   contentJson: string | null;
   rawLineNo: number;
+  turnId: string | null;
 }
 
 export interface ParsedToolCall {
@@ -31,6 +35,7 @@ export interface ParsedToolCall {
   toolName: string;
   argumentsJson: string | null;
   rawLineNo: number;
+  turnId: string | null;
 }
 
 export interface ParsedToolOutput {
@@ -40,33 +45,85 @@ export interface ParsedToolOutput {
   outputText: string;
   outputJson: string | null;
   rawLineNo: number;
+  turnId: string | null;
 }
 
-export interface ParsedSessionFile {
-  meta: CodexSessionMeta;
+export interface ParsedSessionChunk {
+  meta?: CodexSessionMeta;
   rawEvents: ParsedRawEvent[];
   messages: ParsedMessage[];
   toolCalls: ParsedToolCall[];
   toolOutputs: ParsedToolOutput[];
   lineCount: number;
+  indexedBytes: number;
+  currentTurnId: string | null;
 }
 
-export function parseSessionFile(filePath: string): ParsedSessionFile {
-  const text = fs.readFileSync(filePath, "utf8");
-  const lines = text.split(/\r?\n/);
+export interface ParsedSessionFile extends ParsedSessionChunk {
+  meta: CodexSessionMeta;
+}
+
+export function parseSessionFile(filePath: string, endByte = fs.statSync(filePath).size): ParsedSessionFile {
+  const parsed = parseSessionChunk(filePath, {
+    startByte: 0,
+    endByte,
+    startSequence: 0,
+    currentTurnId: null
+  });
+  return {
+    ...parsed,
+    meta: parsed.meta ?? {
+      id: deriveSessionIdFromFile(filePath),
+      timestamp: parsed.rawEvents[0]?.timestamp ?? undefined
+    }
+  };
+}
+
+export function parseSessionChunk(
+  filePath: string,
+  options: {
+    startByte: number;
+    endByte: number;
+    startSequence: number;
+    currentTurnId: string | null;
+  }
+): ParsedSessionChunk {
+  const length = Math.max(0, options.endByte - options.startByte);
+  const buffer = Buffer.allocUnsafe(length);
+  const handle = fs.openSync(filePath, "r");
+  let bytesRead = 0;
+  try {
+    while (bytesRead < length) {
+      const read = fs.readSync(handle, buffer, bytesRead, length - bytesRead, options.startByte + bytesRead);
+      if (read === 0) break;
+      bytesRead += read;
+    }
+  } finally {
+    fs.closeSync(handle);
+  }
+
   const rawEvents: ParsedRawEvent[] = [];
   const messages: ParsedMessage[] = [];
   const toolCalls: ParsedToolCall[] = [];
   const toolOutputs: ParsedToolOutput[] = [];
   let meta: CodexSessionMeta | undefined;
-  let sequence = 0;
+  let sequence = options.startSequence;
+  let currentTurnId = options.currentTurnId;
+  let lineStart = 0;
+  let indexedLength = 0;
 
-  for (let i = 0; i < lines.length; i += 1) {
-    const rawJson = lines[i]?.trimEnd() ?? "";
-    if (rawJson.trim() === "") continue;
+  const parseLine = (lineEnd: number, consumedEnd: number) => {
+    let contentEnd = lineEnd;
+    if (contentEnd > lineStart && buffer[contentEnd - 1] === 0x0d) contentEnd -= 1;
+    const rawJson = buffer.subarray(lineStart, contentEnd).toString("utf8").trimEnd();
+    if (rawJson.trim() === "") {
+      indexedLength = consumedEnd;
+      return;
+    }
     const parsed = safeJsonParse(rawJson);
     if (!parsed || typeof parsed !== "object") {
-      continue;
+      indexedLength = consumedEnd;
+      return;
     }
 
     sequence += 1;
@@ -76,25 +133,39 @@ export function parseSessionFile(filePath: string): ParsedSessionFile {
     const payloadType = stringValue(payload.type) ?? null;
     const role = stringValue(payload.role) ?? null;
     const timestamp = normalizeTimestamp(stringValue(record.timestamp));
+    if (eventType === "event_msg" && payloadType === "task_started") {
+      currentTurnId = stringValue(payload.turn_id) ?? currentTurnId;
+    }
     const raw: ParsedRawEvent = {
-      lineNo: i + 1,
+      lineNo: sequence,
       sequence,
+      byteStart: options.startByte + lineStart,
+      byteLength: Buffer.byteLength(rawJson, "utf8"),
       timestamp,
       eventType,
       payloadType,
       role,
+      turnId: currentTurnId,
       rawJson,
       parsed: record,
       payload
     };
     rawEvents.push(raw);
+    const finish = () => {
+      if (eventType === "event_msg" && payloadType === "task_complete") currentTurnId = null;
+      indexedLength = consumedEnd;
+    };
 
     if (eventType === "session_meta") {
       if (!meta) meta = extractMeta(payload);
-      continue;
+      finish();
+      return;
     }
 
-    if (eventType !== "response_item") continue;
+    if (eventType !== "response_item") {
+      finish();
+      return;
+    }
 
     if (payloadType === "message") {
       const content = payload.content;
@@ -105,15 +176,20 @@ export function parseSessionFile(filePath: string): ParsedSessionFile {
         role: normalizeRole(role),
         contentText,
         contentJson: content === undefined ? null : jsonString(content),
-        rawLineNo: raw.lineNo
+        rawLineNo: raw.lineNo,
+        turnId: currentTurnId
       });
-      continue;
+      finish();
+      return;
     }
 
     if (payloadType === "function_call" || payloadType === "custom_tool_call") {
       const callId = stringValue(payload.call_id) ?? stringValue(payload.id);
       const toolName = stringValue(payload.name) ?? payloadType;
-      if (!callId) continue;
+      if (!callId) {
+        finish();
+        return;
+      }
       const argsValue = payload.arguments ?? payload.input;
       toolCalls.push({
         sequence,
@@ -121,14 +197,19 @@ export function parseSessionFile(filePath: string): ParsedSessionFile {
         callId,
         toolName,
         argumentsJson: argsValue === undefined ? null : stringifyArgument(argsValue),
-        rawLineNo: raw.lineNo
+        rawLineNo: raw.lineNo,
+        turnId: currentTurnId
       });
-      continue;
+      finish();
+      return;
     }
 
     if (payloadType === "function_call_output" || payloadType === "custom_tool_call_output") {
       const callId = stringValue(payload.call_id) ?? stringValue(payload.id);
-      if (!callId) continue;
+      if (!callId) {
+        finish();
+        return;
+      }
       const outputValue = payload.output ?? payload.result ?? payload.content;
       toolOutputs.push({
         sequence,
@@ -136,16 +217,25 @@ export function parseSessionFile(filePath: string): ParsedSessionFile {
         callId,
         outputText: textFromContent(outputValue),
         outputJson: outputValue === undefined ? null : jsonString(outputValue),
-        rawLineNo: raw.lineNo
+        rawLineNo: raw.lineNo,
+        turnId: currentTurnId
       });
     }
-  }
+    finish();
+  };
 
-  if (!meta?.id) {
-    meta = {
-      id: deriveSessionIdFromFile(filePath),
-      timestamp: rawEvents[0]?.timestamp ?? undefined
-    };
+  for (let i = 0; i < bytesRead; i += 1) {
+    if (buffer[i] !== 0x0a) continue;
+    parseLine(i, i + 1);
+    indexedLength = i + 1;
+    lineStart = i + 1;
+  }
+  if (lineStart < bytesRead) {
+    const candidate = buffer.subarray(lineStart, bytesRead).toString("utf8").trimEnd();
+    if (candidate.trim() !== "" && safeJsonParse(candidate) !== undefined) {
+      parseLine(bytesRead, bytesRead);
+      indexedLength = bytesRead;
+    }
   }
 
   return {
@@ -154,7 +244,9 @@ export function parseSessionFile(filePath: string): ParsedSessionFile {
     messages,
     toolCalls,
     toolOutputs,
-    lineCount: rawEvents.length
+    lineCount: sequence,
+    indexedBytes: options.startByte + indexedLength,
+    currentTurnId
   };
 }
 

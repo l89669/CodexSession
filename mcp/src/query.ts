@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { Db } from "./db.js";
+import { HistorySegment, resolveSessionHistory } from "./history-view.js";
 import { CodexSessionIndexer } from "./indexer.js";
 import { ArchiveScope, KeywordMatch, MessageRole, SearchScope, SortOrder, SyncResult } from "./types.js";
 import {
@@ -47,6 +48,35 @@ interface FindTextRow {
   occurrences: number;
 }
 
+type MessageQueryRow = Record<string, unknown> & {
+  sequence: number;
+  timestamp: string | null;
+  role: string;
+  content_text: string;
+  content_json: string | null;
+  raw_json?: string;
+};
+
+type ToolQueryRow = Record<string, unknown> & {
+  sequence: number;
+  timestamp: string | null;
+  call_id: string;
+  tool_name: string;
+  arguments_json: string | null;
+  output_sequence: number | null;
+  output_timestamp: string | null;
+  output_text: string | null;
+  output_json: string | null;
+  call_raw_json?: string;
+  output_raw_json?: string;
+};
+
+type LocatorLookupRow = Record<string, unknown> & {
+  session_id: string;
+  sequence: number;
+  timestamp: string | null;
+};
+
 export class CodexSessionQueries {
   private readonly db: Db;
   private readonly indexer: SessionQueryIndexer;
@@ -90,28 +120,14 @@ export class CodexSessionQueries {
     }
 
     const synced = await this.syncNowForTokenLookup();
-    if (!synced) return this.indexingEnvelope();
-
-    const rows = this.db
-      .prepare(
-        `SELECT
-           l.token,
-           l.session_id,
-           l.sequence,
-           l.timestamp,
-           l.call_id,
-           l.tool_name,
-           l.source,
-           s.thread_name,
-           s.cwd,
-           s.updated_at,
-           s.archive_scope
-         FROM session_locator_tokens l
-         JOIN sessions s ON s.session_id = l.session_id
-         WHERE l.token = ?
-         ORDER BY l.timestamp DESC, l.sequence DESC`
-      )
-      .all(token) as Array<Record<string, unknown> & { session_id: string }>;
+    let rows = this.locatorRows(token);
+    if (!synced) {
+      const deadline = Date.now() + this.waitForIdleMs;
+      while (rows.length === 0 && Date.now() < deadline) {
+        await delay(100);
+        rows = this.locatorRows(token);
+      }
+    }
 
     if (rows.length === 0) {
       return {
@@ -315,52 +331,57 @@ export class CodexSessionQueries {
     if (!ready) return this.indexingEnvelope();
     const order = parseOrder(args.order);
     const maxChars = parseLimit(args.max_chars, DEFAULT_TEXT_CHARS, 100_000);
-    const params: unknown[] = [args.session_id];
-    const where = ["m.session_id = ?"];
-
-    if (args.roles?.length) {
-      where.push(`m.role IN (${args.roles.map(() => "?").join(", ")})`);
-      params.push(...args.roles);
-    }
     const from = parseTimeToUtcIso(args.time_from);
     const to = parseTimeToUtcIso(args.time_to);
-    if (from) {
-      where.push("m.timestamp >= ?");
-      params.push(from);
-    }
-    if (to) {
-      where.push("m.timestamp <= ?");
-      params.push(to);
-    }
+    const view = resolveSessionHistory(this.db, args.session_id);
+    let rows: MessageQueryRow[] = view.segments.flatMap((segment) => {
+      const params: unknown[] = [segment.sessionId, segment.minSequence];
+      const where = ["m.session_id = ?", "m.sequence >= ?"];
+      if (segment.maxSequence !== null) {
+        where.push("m.sequence <= ?");
+        params.push(segment.maxSequence);
+      }
+      if (args.roles?.length) {
+        where.push(`m.role IN (${args.roles.map(() => "?").join(", ")})`);
+        params.push(...args.roles);
+      }
+      if (from) {
+        where.push("m.timestamp >= ?");
+        params.push(from);
+      }
+      if (to) {
+        where.push("m.timestamp <= ?");
+        params.push(to);
+      }
+      const rawSelect = args.include_raw ? ", r.raw_json" : "";
+      const rawJoin = args.include_raw ? "JOIN raw_events r ON r.id = m.raw_event_id" : "";
+      return (this.db
+        .prepare(
+          `SELECT m.sequence, m.timestamp, m.role, m.content_text, m.content_json${rawSelect}
+           FROM messages m
+           ${rawJoin}
+           WHERE ${where.join(" AND ")}`
+        )
+        .all(...params) as MessageQueryRow[])
+        .map((row) => ({ ...row, sequence: row.sequence + segment.sequenceOffset }));
+    });
     if (args.around_sequence !== undefined) {
       const before = parseLimit(args.before_count, 5, 100);
       const after = parseLimit(args.after_count, 5, 100);
-      where.push("m.sequence BETWEEN ? AND ?");
-      params.push(args.around_sequence - before, args.around_sequence + after);
+      rows = rows.filter((row) =>
+        row.sequence >= args.around_sequence! - before &&
+        row.sequence <= args.around_sequence! + after
+      );
     } else {
       if (args.index_from !== undefined) {
-        where.push("m.sequence >= ?");
-        params.push(args.index_from);
+        rows = rows.filter((row) => row.sequence >= args.index_from!);
       }
       if (args.index_to !== undefined) {
-        where.push("m.sequence <= ?");
-        params.push(args.index_to);
+        rows = rows.filter((row) => row.sequence <= args.index_to!);
       }
     }
-    params.push(parseLimit(args.limit, DEFAULT_LIST_LIMIT));
-
-    const rawSelect = args.include_raw ? ", r.raw_json" : "";
-    const rawJoin = args.include_raw ? "JOIN raw_events r ON r.id = m.raw_event_id" : "";
-    const rows = this.db
-      .prepare(
-        `SELECT m.sequence, m.timestamp, m.role, m.content_text, m.content_json${rawSelect}
-         FROM messages m
-         ${rawJoin}
-         WHERE ${where.join(" AND ")}
-         ORDER BY m.sequence ${order.toUpperCase()}
-         LIMIT ?`
-      )
-      .all(...params) as Array<Record<string, unknown> & { content_text: string }>;
+    rows.sort((left, right) => order === "asc" ? left.sequence - right.sequence : right.sequence - left.sequence);
+    rows = rows.slice(0, parseLimit(args.limit, DEFAULT_LIST_LIMIT));
 
     return {
       status: "ok",
@@ -373,7 +394,8 @@ export class CodexSessionQueries {
           content_text: truncateText(row.content_text, maxChars),
           content_json: row.content_json,
           raw_json: args.include_raw ? row.raw_json : undefined
-        }))
+        })),
+        ...(view.parentHistoryStatus ? { parent_history_status: view.parentHistoryStatus } : {})
       }
     };
   }
@@ -384,48 +406,58 @@ export class CodexSessionQueries {
     const limit = parseLimit(args.limit, 3, 100);
     const maxChars = parseLimit(args.max_chars, DEFAULT_TEXT_CHARS, 100_000);
     const includeRaw = Boolean(args.include_raw);
-    const userRawJoin = includeRaw ? "JOIN raw_events user_raw ON user_raw.id = m.raw_event_id" : "";
-    const taskRawJoin = includeRaw ? "JOIN raw_events task_raw ON task_raw.id = i.raw_event_id" : "";
-    const userRawSelect = includeRaw ? "user_raw.raw_json" : "NULL";
-    const taskRawSelect = includeRaw ? "task_raw.raw_json" : "NULL";
-    const rows = this.db
-      .prepare(
-        `SELECT sequence, timestamp, input_type, role, content_text,
-                token, task_text, call_id, tool_name, raw_json
-         FROM (
-           SELECT m.sequence, m.timestamp, 'user_message' AS input_type,
+    const view = resolveSessionHistory(this.db, args.session_id);
+    const rows = view.segments.flatMap((segment) => {
+      const range = segment.maxSequence === null ? "" : "AND m.sequence <= ?";
+      const taskRange = segment.maxSequence === null ? "" : "AND i.sequence <= ?";
+      const userParams: unknown[] = [segment.sessionId, segment.minSequence];
+      const taskParams: unknown[] = [segment.sessionId, segment.minSequence];
+      if (segment.maxSequence !== null) {
+        userParams.push(segment.maxSequence);
+        taskParams.push(segment.maxSequence);
+      }
+      const userRawJoin = includeRaw ? "JOIN raw_events user_raw ON user_raw.id = m.raw_event_id" : "";
+      const taskRawJoin = includeRaw ? "JOIN raw_events task_raw ON task_raw.id = i.raw_event_id" : "";
+      const userRawSelect = includeRaw ? "user_raw.raw_json" : "NULL";
+      const taskRawSelect = includeRaw ? "task_raw.raw_json" : "NULL";
+      const userRows = this.db
+        .prepare(
+          `SELECT m.sequence, m.timestamp, 'user_message' AS input_type,
                   m.role, m.content_text,
                   NULL AS token, NULL AS task_text, NULL AS call_id, NULL AS tool_name,
                   ${userRawSelect} AS raw_json
            FROM messages m
            ${userRawJoin}
-           WHERE m.session_id = ? AND m.role = 'user'
-
-           UNION ALL
-
-           SELECT i.sequence, i.timestamp, 'published_task_retrieval' AS input_type,
+           WHERE m.session_id = ? AND m.sequence >= ? ${range} AND m.role = 'user'`
+        )
+        .all(...userParams) as Array<Record<string, unknown> & { sequence: number }>;
+      const taskRows = this.db
+        .prepare(
+          `SELECT i.sequence, i.timestamp, 'published_task_retrieval' AS input_type,
                   NULL AS role, NULL AS content_text,
                   i.token, i.task_text, i.call_id, i.tool_name,
                   ${taskRawSelect} AS raw_json
            FROM session_task_inputs i
            ${taskRawJoin}
-           WHERE i.session_id = ?
-         )
-         ORDER BY sequence DESC
-         LIMIT ?`
-      )
-      .all(args.session_id, args.session_id, limit) as Array<{
-        sequence: number;
-        timestamp: string | null;
-        input_type: "user_message" | "published_task_retrieval";
+           WHERE i.session_id = ? AND i.sequence >= ? ${taskRange}`
+        )
+        .all(...taskParams) as Array<Record<string, unknown> & { sequence: number }>;
+      return [...userRows, ...taskRows].map((row) => ({
+        ...row,
+        sequence: row.sequence + segment.sequenceOffset
+      }));
+    }).sort((left, right) => right.sequence - left.sequence).slice(0, limit) as Array<{
+         sequence: number;
+         timestamp: string | null;
+         input_type: "user_message" | "published_task_retrieval";
         role: string | null;
         content_text: string | null;
         token: string | null;
         task_text: string | null;
         call_id: string | null;
-        tool_name: string | null;
-        raw_json: string | null;
-      }>;
+         tool_name: string | null;
+         raw_json: string | null;
+       }>;
 
     const inputs = rows.map((row) => {
       const common = {
@@ -455,7 +487,8 @@ export class CodexSessionQueries {
       status: "ok",
       data: {
         session_id: args.session_id,
-        inputs
+        inputs,
+        ...(view.parentHistoryStatus ? { parent_history_status: view.parentHistoryStatus } : {})
       }
     };
   }
@@ -475,46 +508,56 @@ export class CodexSessionQueries {
     const ready = await this.ensureReady();
     if (!ready) return this.indexingEnvelope();
     const order = parseOrder(args.order);
-    const params: unknown[] = [args.session_id];
-    const where = ["t.session_id = ?"];
-    if (args.tool_name_contains) {
-      where.push("t.tool_name LIKE ?");
-      params.push(`%${args.tool_name_contains}%`);
-    }
     const from = parseTimeToUtcIso(args.time_from);
     const to = parseTimeToUtcIso(args.time_to);
-    if (from) {
-      where.push("t.timestamp >= ?");
-      params.push(from);
-    }
-    if (to) {
-      where.push("t.timestamp <= ?");
-      params.push(to);
-    }
-    if (args.has_output !== undefined) {
-      where.push(args.has_output ? "t.output_raw_event_id IS NOT NULL" : "t.output_raw_event_id IS NULL");
-    }
-    if (args.keyword) {
-      where.push("(COALESCE(t.arguments_json, '') LIKE ? OR COALESCE(t.output_text, '') LIKE ? OR COALESCE(t.tool_name, '') LIKE ?)");
-      params.push(`%${args.keyword}%`, `%${args.keyword}%`, `%${args.keyword}%`);
-    }
-    params.push(parseLimit(args.limit, DEFAULT_LIST_LIMIT));
-    const rawSelect = args.include_raw ? ", call_raw.raw_json AS call_raw_json, out_raw.raw_json AS output_raw_json" : "";
-    const rawJoin = args.include_raw
-      ? "JOIN raw_events call_raw ON call_raw.id = t.call_raw_event_id LEFT JOIN raw_events out_raw ON out_raw.id = t.output_raw_event_id"
-      : "";
-    const rows = this.db
-      .prepare(
-        `SELECT
-           t.sequence, t.timestamp, t.call_id, t.tool_name, t.arguments_json,
-           t.output_sequence, t.output_timestamp, t.output_text, t.output_json${rawSelect}
-         FROM tool_calls t
-         ${rawJoin}
-         WHERE ${where.join(" AND ")}
-         ORDER BY t.sequence ${order.toUpperCase()}
-         LIMIT ?`
-      )
-      .all(...params) as Array<Record<string, unknown> & { output_text: string | null }>;
+    const view = resolveSessionHistory(this.db, args.session_id);
+    let rows: ToolQueryRow[] = view.segments.flatMap((segment) => {
+      const params: unknown[] = [segment.sessionId, segment.minSequence];
+      const where = ["t.session_id = ?", "t.sequence >= ?"];
+      if (segment.maxSequence !== null) {
+        where.push("t.sequence <= ?");
+        params.push(segment.maxSequence);
+      }
+      if (args.tool_name_contains) {
+        where.push("t.tool_name LIKE ?");
+        params.push(`%${args.tool_name_contains}%`);
+      }
+      if (from) {
+        where.push("t.timestamp >= ?");
+        params.push(from);
+      }
+      if (to) {
+        where.push("t.timestamp <= ?");
+        params.push(to);
+      }
+      if (args.has_output !== undefined) {
+        where.push(args.has_output ? "t.output_raw_event_id IS NOT NULL" : "t.output_raw_event_id IS NULL");
+      }
+      if (args.keyword) {
+        where.push("(COALESCE(t.arguments_json, '') LIKE ? OR COALESCE(t.output_text, '') LIKE ? OR COALESCE(t.tool_name, '') LIKE ?)");
+        params.push(`%${args.keyword}%`, `%${args.keyword}%`, `%${args.keyword}%`);
+      }
+      const rawSelect = args.include_raw ? ", call_raw.raw_json AS call_raw_json, out_raw.raw_json AS output_raw_json" : "";
+      const rawJoin = args.include_raw
+        ? "JOIN raw_events call_raw ON call_raw.id = t.call_raw_event_id LEFT JOIN raw_events out_raw ON out_raw.id = t.output_raw_event_id"
+        : "";
+      return (this.db
+        .prepare(
+          `SELECT
+             t.sequence, t.timestamp, t.call_id, t.tool_name, t.arguments_json,
+             t.output_sequence, t.output_timestamp, t.output_text, t.output_json${rawSelect}
+           FROM tool_calls t
+           ${rawJoin}
+           WHERE ${where.join(" AND ")}`
+        )
+        .all(...params) as ToolQueryRow[]).map((row) => ({
+          ...row,
+          sequence: row.sequence + segment.sequenceOffset,
+          output_sequence: row.output_sequence === null ? null : row.output_sequence + segment.sequenceOffset
+        }));
+    });
+    rows.sort((left, right) => order === "asc" ? left.sequence - right.sequence : right.sequence - left.sequence);
+    rows = rows.slice(0, parseLimit(args.limit, DEFAULT_LIST_LIMIT));
     const maxOutput = parseLimit(args.max_output_chars, DEFAULT_TOOL_OUTPUT_CHARS, 100_000);
     return {
       status: "ok",
@@ -532,7 +575,8 @@ export class CodexSessionQueries {
           output_json: row.output_json,
           call_raw_json: args.include_raw ? row.call_raw_json : undefined,
           output_raw_json: args.include_raw ? row.output_raw_json : undefined
-        }))
+        })),
+        ...(view.parentHistoryStatus ? { parent_history_status: view.parentHistoryStatus } : {})
       }
     };
   }
@@ -566,14 +610,17 @@ export class CodexSessionQueries {
     const to = parseTimeToUtcIso(args.time_to);
 
     const results: Array<Record<string, unknown>> = [];
-    if (scope === "messages" || scope === "all") {
-      results.push(...this.searchMessages({ sessionId: args.session_id, keywords, match, roles: args.roles, from, to, order, includeRaw: Boolean(args.include_raw), maxChars }));
-    }
-    if (scope === "tool_calls" || scope === "tool_outputs" || scope === "all") {
-      results.push(...this.searchToolCalls({ sessionId: args.session_id, keywords, match, scope, from, to, order, includeRaw: Boolean(args.include_raw), maxChars }));
-    }
-    if (scope === "raw_events" || scope === "all") {
-      results.push(...this.searchRawEvents({ sessionId: args.session_id, keywords, match, from, to, order, includeRaw: Boolean(args.include_raw), maxChars }));
+    const view = resolveSessionHistory(this.db, args.session_id);
+    for (const segment of view.segments) {
+      if (scope === "messages" || scope === "all") {
+        results.push(...this.searchMessages({ segment, keywords, match, roles: args.roles, from, to, order, includeRaw: Boolean(args.include_raw), maxChars }));
+      }
+      if (scope === "tool_calls" || scope === "tool_outputs" || scope === "all") {
+        results.push(...this.searchToolCalls({ segment, keywords, match, scope, from, to, order, includeRaw: Boolean(args.include_raw), maxChars }));
+      }
+      if (scope === "raw_events" || scope === "all") {
+        results.push(...this.searchRawEvents({ segment, keywords, match, from, to, order, includeRaw: Boolean(args.include_raw), maxChars }));
+      }
     }
 
     results.sort((a, b) => {
@@ -589,13 +636,14 @@ export class CodexSessionQueries {
         keywords,
         match,
         scope,
-        results: results.slice(0, limit)
+        results: results.slice(0, limit),
+        ...(view.parentHistoryStatus ? { parent_history_status: view.parentHistoryStatus } : {})
       }
     };
   }
 
   private searchMessages(options: {
-    sessionId: string;
+    segment: HistorySegment;
     keywords: string[];
     match: KeywordMatch;
     roles?: MessageRole[];
@@ -605,8 +653,12 @@ export class CodexSessionQueries {
     includeRaw: boolean;
     maxChars: number;
   }): Array<Record<string, unknown>> {
-    const params: unknown[] = [options.sessionId];
-    const where = ["m.session_id = ?"];
+    const params: unknown[] = [options.segment.sessionId, options.segment.minSequence];
+    const where = ["m.session_id = ?", "m.sequence >= ?"];
+    if (options.segment.maxSequence !== null) {
+      where.push("m.sequence <= ?");
+      params.push(options.segment.maxSequence);
+    }
     if (options.roles?.length) {
       where.push(`m.role IN (${options.roles.map(() => "?").join(", ")})`);
       params.push(...options.roles);
@@ -636,9 +688,9 @@ export class CodexSessionQueries {
       const matched = matchedKeywords(row.content_text, options.keywords);
       if (!matchesMode(matched, options.keywords, options.match)) return [];
       return [
-        {
-          scope: "messages",
-          sequence: row.sequence,
+         {
+           scope: "messages",
+           sequence: Number(row.sequence) + options.segment.sequenceOffset,
           timestamp: row.timestamp,
           role: row.role,
           matched_keywords: matched,
@@ -650,7 +702,7 @@ export class CodexSessionQueries {
   }
 
   private searchToolCalls(options: {
-    sessionId: string;
+    segment: HistorySegment;
     keywords: string[];
     match: KeywordMatch;
     scope: SearchScope;
@@ -660,8 +712,12 @@ export class CodexSessionQueries {
     includeRaw: boolean;
     maxChars: number;
   }): Array<Record<string, unknown>> {
-    const params: unknown[] = [options.sessionId];
-    const where = ["t.session_id = ?"];
+    const params: unknown[] = [options.segment.sessionId, options.segment.minSequence];
+    const where = ["t.session_id = ?", "t.sequence >= ?"];
+    if (options.segment.maxSequence !== null) {
+      where.push("t.sequence <= ?");
+      params.push(options.segment.maxSequence);
+    }
     if (options.from) {
       where.push("t.timestamp >= ?");
       params.push(options.from);
@@ -693,9 +749,9 @@ export class CodexSessionQueries {
       const matched = matchedKeywords(searchable, options.keywords);
       if (!matchesMode(matched, options.keywords, options.match)) return [];
       return [
-        {
-          scope: "tool_calls",
-          sequence: row.sequence,
+         {
+           scope: "tool_calls",
+           sequence: Number(row.sequence) + options.segment.sequenceOffset,
           timestamp: row.timestamp,
           call_id: row.call_id,
           tool_name: row.tool_name,
@@ -710,7 +766,7 @@ export class CodexSessionQueries {
   }
 
   private searchRawEvents(options: {
-    sessionId: string;
+    segment: HistorySegment;
     keywords: string[];
     match: KeywordMatch;
     from?: string;
@@ -719,8 +775,12 @@ export class CodexSessionQueries {
     includeRaw: boolean;
     maxChars: number;
   }): Array<Record<string, unknown>> {
-    const params: unknown[] = [options.sessionId];
-    const where = ["session_id = ?"];
+    const params: unknown[] = [options.segment.sessionId, options.segment.minSequence];
+    const where = ["session_id = ?", "sequence >= ?"];
+    if (options.segment.maxSequence !== null) {
+      where.push("sequence <= ?");
+      params.push(options.segment.maxSequence);
+    }
     if (options.from) {
       where.push("timestamp >= ?");
       params.push(options.from);
@@ -743,9 +803,9 @@ export class CodexSessionQueries {
       const matched = matchedKeywords(row.raw_json, options.keywords);
       if (!matchesMode(matched, options.keywords, options.match)) return [];
       return [
-        {
-          scope: "raw_events",
-          sequence: row.sequence,
+         {
+           scope: "raw_events",
+           sequence: Number(row.sequence) + options.segment.sequenceOffset,
           timestamp: row.timestamp,
           event_type: row.event_type,
           payload_type: row.payload_type,
@@ -760,7 +820,8 @@ export class CodexSessionQueries {
 
   private async ensureReady(): Promise<boolean> {
     this.indexer.syncIfNeeded();
-    return this.indexer.waitForIdle(this.waitForIdleMs);
+    if (!await this.indexer.waitForIdle(this.waitForIdleMs)) return false;
+    return !this.indexer.status().indexing;
   }
 
   private async syncNowForTokenLookup(): Promise<boolean> {
@@ -773,8 +834,33 @@ export class CodexSessionQueries {
       }
       return true;
     } catch {
-      return this.ensureReady();
+      this.indexer.syncIfNeeded();
+      await this.indexer.waitForIdle(this.waitForIdleMs);
+      return false;
     }
+  }
+
+  private locatorRows(token: string): LocatorLookupRow[] {
+    return this.db
+      .prepare(
+        `SELECT
+           l.token,
+           l.session_id,
+           l.sequence,
+           l.timestamp,
+           l.call_id,
+           l.tool_name,
+           l.source,
+           s.thread_name,
+           s.cwd,
+           s.updated_at,
+           s.archive_scope
+         FROM session_locator_tokens l
+         JOIN sessions s ON s.session_id = l.session_id
+         WHERE l.token = ?
+         ORDER BY l.timestamp DESC, l.sequence DESC`
+      )
+      .all(token) as LocatorLookupRow[];
   }
 
   private async waitForSyncResult(promise: Promise<SyncResult>): Promise<{ done: true; result: SyncResult } | { done: false }> {
@@ -859,4 +945,8 @@ function markerForToken(token: string): string {
 
 function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

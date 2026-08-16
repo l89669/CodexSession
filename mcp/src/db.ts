@@ -53,6 +53,10 @@ export function migrate(db: Db): void {
       size INTEGER NOT NULL,
       mtime_ms REAL NOT NULL,
       line_count INTEGER NOT NULL,
+      indexed_bytes INTEGER,
+      boundary_hash TEXT,
+      current_turn_id TEXT,
+      index_version INTEGER NOT NULL DEFAULT 1,
       indexed_at TEXT NOT NULL,
       FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
     );
@@ -67,6 +71,8 @@ export function migrate(db: Db): void {
       event_type TEXT NOT NULL,
       payload_type TEXT,
       role TEXT,
+      byte_start INTEGER,
+      byte_length INTEGER,
       raw_json TEXT NOT NULL,
       FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
     );
@@ -140,6 +146,21 @@ export function migrate(db: Db): void {
       FOREIGN KEY (raw_event_id) REFERENCES raw_events(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS session_lineage (
+      session_id TEXT PRIMARY KEY,
+      parent_session_id TEXT NOT NULL,
+      replay_parent_sequence INTEGER NOT NULL,
+      local_start_sequence INTEGER NOT NULL,
+      sequence_offset INTEGER NOT NULL,
+      parent_cutoff_sequence INTEGER NOT NULL,
+      boundary_message_sequence INTEGER,
+      boundary_byte_start INTEGER,
+      boundary_byte_length INTEGER,
+      boundary_hash TEXT,
+      indexed_at TEXT NOT NULL,
+      FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS leader_lease (
       singleton_key TEXT PRIMARY KEY,
       holder_id TEXT NOT NULL,
@@ -173,6 +194,7 @@ export function migrate(db: Db): void {
     CREATE INDEX IF NOT EXISTS idx_tool_calls_output_raw_event ON tool_calls(output_raw_event_id);
     CREATE INDEX IF NOT EXISTS idx_session_locator_tokens_token ON session_locator_tokens(token);
     CREATE INDEX IF NOT EXISTS idx_session_locator_tokens_session ON session_locator_tokens(session_id, sequence);
+    CREATE INDEX IF NOT EXISTS idx_session_lineage_parent ON session_lineage(parent_session_id);
   `);
 
   if (!columnExists(db, "sessions", "forked_from_id")) {
@@ -180,6 +202,24 @@ export function migrate(db: Db): void {
   }
   if (!columnExists(db, "agent_tasks", "retrieval_count")) {
     db.exec("ALTER TABLE agent_tasks ADD COLUMN retrieval_count INTEGER NOT NULL DEFAULT 0;");
+  }
+  if (!columnExists(db, "session_files", "indexed_bytes")) {
+    db.exec("ALTER TABLE session_files ADD COLUMN indexed_bytes INTEGER;");
+  }
+  if (!columnExists(db, "session_files", "boundary_hash")) {
+    db.exec("ALTER TABLE session_files ADD COLUMN boundary_hash TEXT;");
+  }
+  if (!columnExists(db, "session_files", "current_turn_id")) {
+    db.exec("ALTER TABLE session_files ADD COLUMN current_turn_id TEXT;");
+  }
+  if (!columnExists(db, "session_files", "index_version")) {
+    db.exec("ALTER TABLE session_files ADD COLUMN index_version INTEGER NOT NULL DEFAULT 1;");
+  }
+  if (!columnExists(db, "raw_events", "byte_start")) {
+    db.exec("ALTER TABLE raw_events ADD COLUMN byte_start INTEGER;");
+  }
+  if (!columnExists(db, "raw_events", "byte_length")) {
+    db.exec("ALTER TABLE raw_events ADD COLUMN byte_length INTEGER;");
   }
   db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_forked_from ON sessions(forked_from_id);");
 
@@ -199,6 +239,9 @@ export function migrate(db: Db): void {
   }
   if (version < 5) {
     db.pragma("user_version = 5");
+  }
+  if (version === 0) {
+    db.pragma("user_version = 6");
   }
 }
 
