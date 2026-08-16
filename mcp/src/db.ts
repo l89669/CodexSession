@@ -161,14 +161,6 @@ export function migrate(db: Db): void {
       FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
     );
 
-    CREATE TABLE IF NOT EXISTS leader_lease (
-      singleton_key TEXT PRIMARY KEY,
-      holder_id TEXT NOT NULL,
-      renewed_at_ms INTEGER NOT NULL,
-      lease_ms INTEGER NOT NULL,
-      generation INTEGER NOT NULL
-    );
-
     CREATE TABLE IF NOT EXISTS sync_status (
       singleton_key TEXT PRIMARY KEY,
       indexing INTEGER NOT NULL,

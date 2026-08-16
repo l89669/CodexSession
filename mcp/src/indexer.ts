@@ -1,9 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { Worker } from "node:worker_threads";
 import { watch, FSWatcher } from "chokidar";
-import { Db, deleteFileRows, deleteSessionRows, isSqliteBusy } from "./db.js";
+import { Db, deleteFileRows, deleteSessionRows } from "./db.js";
 import { analyzeForkLineage, ForkLineageAnalysis } from "./lineage.js";
 import { RuntimePaths, toPortablePath } from "./paths.js";
 import {
@@ -15,7 +14,6 @@ import {
 import { readSessionIndex } from "./session-index.js";
 import { ArchiveScope, IndexingStatus, SessionFile, SyncResult } from "./types.js";
 import { ensureDir, listJsonlFiles, nowIso } from "./util.js";
-import { LeaderLease } from "./leader.js";
 
 interface IndexerScheduler {
   setInterval(callback: () => void, delayMs: number): NodeJS.Timeout;
@@ -23,11 +21,8 @@ interface IndexerScheduler {
 }
 
 interface CodexSessionIndexerOptions {
-  holderId?: string;
-  leaseMs?: number;
-  runSyncInProcess?: boolean;
   syncCheckIntervalMs?: number;
-  leaderRenewIntervalMs?: number;
+  pollIntervalMs?: number;
   nowMs?: () => number;
   scheduler?: IndexerScheduler;
 }
@@ -57,21 +52,16 @@ const systemScheduler: IndexerScheduler = {
 export class CodexSessionIndexer {
   private readonly db: Db;
   private readonly paths: RuntimePaths;
-  private readonly lease: LeaderLease;
-  private readonly runSyncInProcess: boolean;
   private readonly syncCheckIntervalMs: number;
-  private readonly leaderRenewIntervalMs: number;
+  private readonly pollIntervalMs: number;
   private readonly nowMs: () => number;
   private readonly scheduler: IndexerScheduler;
   private watcher: FSWatcher | undefined;
   private syncPromise: Promise<SyncResult> | undefined;
-  private activeWorker: Worker | undefined;
-  private leaderTimer: NodeJS.Timeout | undefined;
+  private pollTimer: NodeJS.Timeout | undefined;
   private debounceTimer: NodeJS.Timeout | undefined;
-  private leadershipActive = false;
   private lastSyncCheckMs = 0;
-  private databaseBusyAt: string | null = null;
-  private databaseBusyError: string | null = null;
+  private started = false;
 
   constructor(
     db: Db,
@@ -80,86 +70,59 @@ export class CodexSessionIndexer {
   ) {
     this.db = db;
     this.paths = paths;
-    this.lease = new LeaderLease(db, { holderId: options.holderId, leaseMs: options.leaseMs });
-    this.runSyncInProcess = Boolean(options.runSyncInProcess);
     this.syncCheckIntervalMs = options.syncCheckIntervalMs ?? 5_000;
-    this.leaderRenewIntervalMs = options.leaderRenewIntervalMs ?? 5_000;
+    this.pollIntervalMs = options.pollIntervalMs ?? 2_000;
     this.nowMs = options.nowMs ?? Date.now;
     this.scheduler = options.scheduler ?? systemScheduler;
   }
 
-  get holderId(): string {
-    return this.lease.holderId;
-  }
-
   start(): void {
-    this.tryBecomeLeader();
-    this.leaderTimer = this.scheduler.setInterval(() => {
-      this.tryBecomeLeader();
-    }, this.leaderRenewIntervalMs);
+    if (this.started) return;
+    this.started = true;
+    this.startWatcher();
+    void this.sync({ force: false }).catch(() => undefined);
+    this.pollTimer = this.scheduler.setInterval(() => {
+      void this.sync({ force: false }).catch(() => undefined);
+    }, this.pollIntervalMs);
   }
 
   async stop(): Promise<void> {
-    if (this.leaderTimer) this.scheduler.clearInterval(this.leaderTimer);
+    if (!this.started) return;
+    this.started = false;
+    if (this.pollTimer) this.scheduler.clearInterval(this.pollTimer);
+    this.pollTimer = undefined;
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
+    this.debounceTimer = undefined;
     if (this.watcher) await this.watcher.close();
+    this.watcher = undefined;
     const runningSync = this.syncPromise;
-    if (this.activeWorker) {
-      await this.activeWorker.terminate();
-    }
     if (runningSync) {
-      await runningSync.catch(() => undefined);
-      this.recordSyncError(new Error("index sync stopped before completion"));
-    }
-    try {
-      this.lease.release();
-    } catch (error) {
-      if (!isSqliteBusy(error)) throw error;
-      this.recordBusy(error);
+      await runningSync;
     }
   }
 
-  status(): IndexingStatus & {
-    leader: Record<string, unknown> | undefined;
-    holder_id: string;
-    is_leader: boolean;
-    database_busy: boolean;
-    database_busy_at: string | null;
-  } {
-    try {
-      const row = this.db.prepare("SELECT * FROM sync_status WHERE singleton_key = 'main'").get() as
-        | {
-            indexing: number;
-            started_at: string | null;
-            completed_at: string | null;
-            files_seen: number;
-            files_indexed: number;
-            events_indexed: number;
-            error: string | null;
-          }
-        | undefined;
-      const leader = this.lease.current();
-      const isLeader = this.lease.isLeader();
-      const wasBusyAt = this.databaseBusyAt;
-      this.clearBusy();
-      return {
-        indexing: Boolean(row?.indexing),
-        started_at: row?.started_at ?? null,
-        completed_at: row?.completed_at ?? null,
-        files_seen: row?.files_seen ?? 0,
-        files_indexed: row?.files_indexed ?? 0,
-        events_indexed: row?.events_indexed ?? 0,
-        error: row?.error ?? null,
-        leader,
-        holder_id: this.holderId,
-        is_leader: isLeader,
-        database_busy: false,
-        database_busy_at: wasBusyAt
-      };
-    } catch (error) {
-      if (!isSqliteBusy(error)) throw error;
-      return this.busyStatus(error);
-    }
+  status(): IndexingStatus & { backend_pid: number } {
+    const row = this.db.prepare("SELECT * FROM sync_status WHERE singleton_key = 'main'").get() as
+      | {
+          indexing: number;
+          started_at: string | null;
+          completed_at: string | null;
+          files_seen: number;
+          files_indexed: number;
+          events_indexed: number;
+          error: string | null;
+        }
+      | undefined;
+    return {
+      indexing: Boolean(row?.indexing),
+      started_at: row?.started_at ?? null,
+      completed_at: row?.completed_at ?? null,
+      files_seen: row?.files_seen ?? 0,
+      files_indexed: row?.files_indexed ?? 0,
+      events_indexed: row?.events_indexed ?? 0,
+      error: row?.error ?? null,
+      backend_pid: process.pid
+    };
   }
 
   async waitForIdle(maxMs = 5_000): Promise<boolean> {
@@ -180,20 +143,8 @@ export class CodexSessionIndexer {
 
   async sync(options: { rebuild?: boolean; force?: boolean } = {}): Promise<SyncResult> {
     this.lastSyncCheckMs = this.nowMs();
-    let canWrite: boolean;
-    try {
-      canWrite = this.lease.isLeader() || this.lease.acquireOrRenew();
-    } catch (error) {
-      if (!isSqliteBusy(error)) throw error;
-      this.recordBusy(error);
-      throw new Error(`SQLite index database is locked; retry after the current writer releases it: ${this.databaseBusyError}`);
-    }
-    if (!canWrite) {
-      const status = this.status();
-      throw new Error(`Another MCP server instance holds the index writer lease: ${JSON.stringify(status.leader)}`);
-    }
     if (this.syncPromise) return this.syncPromise;
-    this.syncPromise = this.runSyncInBackground(options).finally(() => {
+    this.syncPromise = Promise.resolve().then(() => this.runSync(options)).finally(() => {
       this.lastSyncCheckMs = this.nowMs();
       this.syncPromise = undefined;
     });
@@ -204,35 +155,8 @@ export class CodexSessionIndexer {
     const now = this.nowMs();
     if (now - this.lastSyncCheckMs < this.syncCheckIntervalMs) return;
     this.lastSyncCheckMs = now;
-    let canWrite: boolean;
-    try {
-      canWrite = this.lease.isLeader() || this.lease.acquireOrRenew();
-    } catch (error) {
-      if (!isSqliteBusy(error)) throw error;
-      this.recordBusy(error);
-      return;
-    }
-    if (!canWrite) return;
     if (this.syncPromise) return;
-    void this.sync({ force: false }).catch((error) => this.recordSyncError(error));
-  }
-
-  private tryBecomeLeader(): void {
-    const wasLeader = this.leadershipActive;
-    let hasLeadership: boolean;
-    try {
-      hasLeadership = this.lease.acquireOrRenew();
-    } catch (error) {
-      if (!isSqliteBusy(error)) throw error;
-      this.recordBusy(error);
-      return;
-    }
-    this.leadershipActive = hasLeadership;
-    if (!hasLeadership) return;
-    this.clearBusy();
-    if (!this.watcher) this.startWatcher();
-    if (wasLeader) return;
-    void this.sync({ force: false }).catch((error) => this.recordSyncError(error));
+    void this.sync({ force: false }).catch(() => undefined);
   }
 
   private startWatcher(): void {
@@ -247,7 +171,7 @@ export class CodexSessionIndexer {
     const schedule = () => {
       if (this.debounceTimer) clearTimeout(this.debounceTimer);
       this.debounceTimer = setTimeout(() => {
-        void this.sync({ force: false }).catch((error) => this.recordSyncError(error));
+        void this.sync({ force: false }).catch(() => undefined);
       }, 300);
     };
     this.watcher.on("add", schedule);
@@ -255,50 +179,6 @@ export class CodexSessionIndexer {
     this.watcher.on("unlink", schedule);
   }
 
-  private runSyncInBackground(options: { rebuild?: boolean; force?: boolean }): Promise<SyncResult> {
-    if (this.runSyncInProcess) {
-      return Promise.resolve().then(() => this.runSync(options));
-    }
-
-    return new Promise((resolve, reject) => {
-      const worker = new Worker(new URL("./sync-worker.js", import.meta.url), {
-        workerData: {
-          codexHome: this.paths.codexHome,
-          indexDbPath: this.paths.indexDbPath,
-          holderId: this.holderId,
-          options
-        }
-      });
-      this.activeWorker = worker;
-      let settled = false;
-
-      const finish = (callback: () => void) => {
-        if (settled) return;
-        settled = true;
-        if (this.activeWorker === worker) this.activeWorker = undefined;
-        callback();
-      };
-
-      worker.once("message", (message: unknown) => {
-        const response = message as { ok?: boolean; result?: SyncResult; error?: string };
-        if (response?.ok && response.result) {
-          finish(() => resolve(response.result as SyncResult));
-          return;
-        }
-        finish(() => reject(new Error(response?.error ?? "index sync worker failed without an error message")));
-      });
-      worker.once("error", (error) => {
-        finish(() => reject(error));
-      });
-      worker.once("exit", (code) => {
-        if (code === 0) {
-          finish(() => reject(new Error("index sync worker exited without returning a result")));
-          return;
-        }
-        finish(() => reject(new Error(`index sync worker exited with code ${code}`)));
-      });
-    });
-  }
 
   private runSync(options: { rebuild?: boolean; force?: boolean }): SyncResult {
     const started = nowIso();
@@ -386,7 +266,6 @@ export class CodexSessionIndexer {
       if (upgradeRebuild) {
         this.db.pragma("user_version = 6");
       }
-      this.clearBusy();
       return result;
     } catch (error) {
       this.recordSyncError(error);
@@ -750,47 +629,11 @@ export class CodexSessionIndexer {
   }
 
   private recordSyncError(error: unknown): void {
-    if (isSqliteBusy(error)) this.recordBusy(error);
     try {
       this.markSyncError(error);
-    } catch (inner) {
-      if (!isSqliteBusy(inner)) throw inner;
-      this.recordBusy(inner);
+    } catch (statusError) {
+      console.error("Failed to record Codex session index sync error", statusError);
     }
-  }
-
-  private recordBusy(error: unknown): void {
-    this.databaseBusyAt = nowIso();
-    this.databaseBusyError = error instanceof Error ? error.message : String(error);
-  }
-
-  private clearBusy(): void {
-    this.databaseBusyAt = null;
-    this.databaseBusyError = null;
-  }
-
-  private busyStatus(error: unknown): IndexingStatus & {
-    leader: undefined;
-    holder_id: string;
-    is_leader: false;
-    database_busy: true;
-    database_busy_at: string;
-  } {
-    this.recordBusy(error);
-    return {
-      indexing: false,
-      started_at: null,
-      completed_at: null,
-      files_seen: 0,
-      files_indexed: 0,
-      events_indexed: 0,
-      error: this.databaseBusyError,
-      leader: undefined,
-      holder_id: this.holderId,
-      is_leader: false,
-      database_busy: true,
-      database_busy_at: this.databaseBusyAt ?? nowIso()
-    };
   }
 }
 

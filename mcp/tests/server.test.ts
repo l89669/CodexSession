@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import Database from "better-sqlite3";
+import net from "node:net";
 import path from "node:path";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -16,85 +16,45 @@ import {
   withTimeout
 } from "./test-fixtures.js";
 
-test("stdio server lists tools while the index database has a locked writer", async (t) => {
+test("stdio clients share one backend, reconnect after backend exit, and release it when idle", async (t) => {
   const env = createFixtureHome(t);
-  const setupDb = openDatabase(env.dbPath, { busyTimeoutMs: 20 });
-  setupDb.close();
-  const blocker = new Database(env.dbPath, { timeout: 20 });
-  blocker.pragma("busy_timeout = 20");
-  blocker.exec("BEGIN IMMEDIATE");
-  env.defer(() => {
-    if (!blocker.open) return;
-    blocker.exec("ROLLBACK");
-    blocker.close();
-  });
+  const port = await availablePort();
+  const clientA = createStdioClient(env, port, "bridge-client-a");
+  const clientB = createStdioClient(env, port, "bridge-client-b");
+  deferClient(env, clientA.client);
+  deferClient(env, clientB.client);
 
-  const client = new Client({ name: "locked-db-test", version: "0.1.0" });
-  deferClient(env, client);
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [path.join(projectRoot, "dist", "src", "server.js")],
-    cwd: projectRoot,
-    env: {
-      ...process.env,
-      CODEX_HOME: env.codexHome,
-      CODEX_SESSION_MCP_DB: env.dbPath,
-      CODEX_SESSION_MCP_BUSY_TIMEOUT_MS: "20"
-    },
-    stderr: "pipe"
-  });
+  await Promise.all([
+    withTimeout(clientA.client.connect(clientA.transport), 5_000, "first MCP initialize should complete"),
+    withTimeout(clientB.client.connect(clientB.transport), 5_000, "second MCP initialize should complete")
+  ]);
+  const [statusA, statusB] = await Promise.all([
+    callToolJson(clientA.client, "codex_session_status", {}),
+    callToolJson(clientB.client, "codex_session_status", {})
+  ]);
+  assert.equal(statusA.backend_pid, statusB.backend_pid);
 
-  await withTimeout(client.connect(transport), 2_000, "MCP initialize should complete while sqlite is locked");
-  const tools = await withTimeout(client.listTools(), 2_000, "MCP listTools should complete while sqlite is locked");
-  assert.equal(tools.tools.some((tool) => tool.name === "codex_session_status"), true);
-});
+  const published = await callToolJson(clientA.client, "codex_session_publish_task", { task: "survives backend restart" });
+  process.kill(statusA.backend_pid);
+  const restarted = await waitForHealth(port, (health) => health.pid !== statusA.backend_pid, 5_000);
+  assert.notEqual(restarted.pid, statusA.backend_pid);
+  const recovered = await retryToolCall(
+    () => callToolJson(clientB.client, "codex_session_get_task", { token: published.data.token }),
+    5_000
+  );
+  assert.equal(recovered.data.task, "survives backend restart");
 
-test("stdio server releases its leader lease when the client closes", async (t) => {
-  const env = createFixtureHome(t);
-  const client = new Client({ name: "lease-release-test", version: "0.1.0" });
-  deferClient(env, client);
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [path.join(projectRoot, "dist", "src", "server.js")],
-    cwd: projectRoot,
-    env: {
-      ...process.env,
-      CODEX_HOME: env.codexHome,
-      CODEX_SESSION_MCP_DB: env.dbPath
-    },
-    stderr: "pipe"
-  });
-
-  await withTimeout(client.connect(transport), 2_000, "MCP initialize should complete");
-  const status = await callToolJson(client, "codex_session_status", {});
-  assert.equal(status.is_leader, true);
-  await client.close();
-
-  const db = openDatabase(env.dbPath);
-  deferDatabase(env, db);
-  await assertEventually(() => {
-    const lease = db.prepare("SELECT * FROM leader_lease WHERE singleton_key = 'codex-session-mcp'").get();
-    assert.equal(lease, undefined);
-  }, 2_000);
+  await Promise.all([clientA.client.close(), clientB.client.close()]);
+  await waitForProcessExit(restarted.pid, 3_000);
 });
 
 test("stdio get_task adds recovery guidance only after the first retrieval", async (t) => {
   const env = createFixtureHome(t);
-  const client = new Client({ name: "repeated-task-retrieval-test", version: "0.1.0" });
+  const port = await availablePort();
+  const { client, transport } = createStdioClient(env, port, "repeated-task-retrieval-test");
   deferClient(env, client);
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [path.join(projectRoot, "dist", "src", "server.js")],
-    cwd: projectRoot,
-    env: {
-      ...process.env,
-      CODEX_HOME: env.codexHome,
-      CODEX_SESSION_MCP_DB: env.dbPath
-    },
-    stderr: "pipe"
-  });
 
-  await withTimeout(client.connect(transport), 2_000, "MCP initialize should complete");
+  await withTimeout(client.connect(transport), 5_000, "MCP initialize should complete");
   const published = await callToolJson(client, "codex_session_publish_task", { task: "Recover this task." });
   assert.equal(published.data.prompt, `token: ${published.data.token}, use codex_session_get_task tool to retrieve exact instruction`);
   assert.equal(typeof published.data.comment, "string");
@@ -107,6 +67,9 @@ test("stdio get_task adds recovery guidance only after the first retrieval", asy
   assert.equal(second.data.task, "Recover this task.");
   assert.equal(typeof second.data.comment, "string");
   assert.ok(second.data.comment.trim().length > 0);
+  const status = await callToolJson(client, "codex_session_status", {});
+  await client.close();
+  await waitForProcessExit(status.backend_pid, 3_000);
 });
 
 test("queries return an indexing envelope without waiting for an active sync", async (t) => {
@@ -123,11 +86,7 @@ test("queries return an indexing envelope without waiting for an active sync", a
     files_indexed: 0,
     events_indexed: 0,
     error: null,
-    leader: undefined,
-    holder_id: "test-holder",
-    is_leader: true,
-    database_busy: false,
-    database_busy_at: null
+    backend_pid: process.pid
   };
   const indexer = {
     status: () => status,
@@ -150,17 +109,85 @@ test("queries return an indexing envelope without waiting for an active sync", a
   assert.deepEqual(sync, { status: "indexing", data: status });
 });
 
-async function assertEventually(assertion: () => void, timeoutMs: number): Promise<void> {
+function createStdioClient(env: ReturnType<typeof createFixtureHome>, port: number, name: string): {
+  client: Client;
+  transport: StdioClientTransport;
+} {
+  return {
+    client: new Client({ name, version: "0.1.0" }),
+    transport: new StdioClientTransport({
+      command: process.execPath,
+      args: [path.join(projectRoot, "dist", "src", "server.js")],
+      cwd: projectRoot,
+      env: {
+        ...process.env,
+        CODEX_HOME: env.codexHome,
+        CODEX_SESSION_MCP_DB: env.dbPath,
+        CODEX_SESSION_MCP_PORT: String(port),
+        CODEX_SESSION_MCP_IDLE_TIMEOUT_MS: "250"
+      },
+      stderr: "pipe"
+    })
+  };
+}
+
+async function availablePort(): Promise<number> {
+  const server = net.createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("could not allocate a local test port");
+  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  return address.port;
+}
+
+async function waitForHealth(
+  port: number,
+  accept: (health: { pid: number }) => boolean,
+  timeoutMs: number
+): Promise<{ pid: number }> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/health`);
+      const health = await response.json() as { pid: number };
+      if (response.ok && accept(health)) return health;
+    } catch {}
+    await delay(50);
+  }
+  throw new Error("backend health did not reach the expected state");
+}
+
+async function waitForProcessExit(pid: number, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      return;
+    }
+    await delay(50);
+  }
+  throw new Error("backend process did not exit after the idle timeout");
+}
+
+async function retryToolCall<T>(call: () => Promise<T>, timeoutMs: number): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   let lastError: unknown;
-  while (Date.now() <= deadline) {
+  while (Date.now() < deadline) {
     try {
-      assertion();
-      return;
+      return await call();
     } catch (error) {
       lastError = error;
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      await delay(50);
     }
   }
-  if (lastError) throw lastError;
+  throw lastError;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

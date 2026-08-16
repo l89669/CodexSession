@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,6 +22,7 @@ ensureDir(activeDir);
 ensureDir(path.join(codexHome, "archived_sessions"));
 const copiedSample = path.join(activeDir, "rollout-simulated-current.jsonl");
 fs.copyFileSync(samplePath, copiedSample);
+const bridgePort = await availablePort();
 
 const parsed = parseSessionFile(samplePath);
 fs.writeFileSync(
@@ -37,7 +39,9 @@ const transport = new StdioClientTransport({
   env: {
     ...process.env,
     CODEX_HOME: codexHome,
-    CODEX_SESSION_MCP_DB: path.join(tmpRoot, "index.sqlite")
+    CODEX_SESSION_MCP_DB: path.join(tmpRoot, "index.sqlite"),
+    CODEX_SESSION_MCP_PORT: String(bridgePort),
+    CODEX_SESSION_MCP_IDLE_TIMEOUT_MS: "250"
   },
   stderr: "pipe"
 });
@@ -65,8 +69,11 @@ const around = await call("codex_session_messages", {
   after_count: 2,
   order: "asc"
 });
+const backend = await fetch(`http://127.0.0.1:${bridgePort}/health`).then((response) => response.json()) as { pid: number };
 
 await client.close();
+await waitForProcessExit(backend.pid, 3_000);
+fs.rmSync(tmpRoot, { recursive: true, force: true });
 
 console.log(
   JSON.stringify(
@@ -100,4 +107,30 @@ function findDistinctiveSnippet(parsedSession: ReturnType<typeof parseSessionFil
   const fallback = parsedSession.messages.find((message) => message.contentText.trim().length >= 40)?.contentText.trim();
   if (!fallback) throw new Error("No distinctive message text found in sample.");
   return fallback.slice(0, 160);
+}
+
+async function availablePort(): Promise<number> {
+  const server = net.createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Could not allocate a local bridge port.");
+  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  return address.port;
+}
+
+async function waitForProcessExit(pid: number, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error("Simulated backend process did not exit after its idle timeout.");
 }

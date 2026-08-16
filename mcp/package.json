@@ -1,7 +1,7 @@
 {
   "name": "codex-session-mcp",
   "version": "0.1.0",
-  "description": "Read-only MCP server for indexing local Codex session JSONL files and retrieving exact prior conversation context.",
+  "description": "Local MCP service for indexing Codex session JSONL and recovering exact agent inputs.",
   "license": "MIT",
   "type": "module",
   "main": "./dist/src/server.js",

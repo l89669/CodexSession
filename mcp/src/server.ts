@@ -1,13 +1,8 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { AgentTaskStore } from "./agent-task-store.js";
-import { openDatabase } from "./db.js";
-import { CodexSessionIndexer } from "./indexer.js";
-import { resolveRuntimePaths } from "./paths.js";
-import { CodexSessionQueries } from "./query.js";
+import type { SessionRuntime } from "./runtime.js";
 
 const archiveScopeSchema = z.enum(["active", "archived", "both"]).default("active");
 const orderSchema = z.enum(["asc", "desc"]).default("desc");
@@ -22,16 +17,8 @@ function taskHandoffPrompt(token: string): string {
   return `token: ${token}, use codex_session_get_task tool to retrieve exact instruction`;
 }
 
-export async function createServer(options: { codexHome?: string; indexDbPath?: string; busyTimeoutMs?: number } = {}): Promise<{
-  server: McpServer;
-  indexer: CodexSessionIndexer;
-}> {
-  const paths = resolveRuntimePaths(options);
-  const db = openDatabase(paths.indexDbPath, { busyTimeoutMs: options.busyTimeoutMs });
-  const indexer = new CodexSessionIndexer(db, paths);
-  const queries = new CodexSessionQueries({ db, indexer });
-  const agentTasks = new AgentTaskStore(db);
-
+export function createMcpServer(runtime: SessionRuntime): McpServer {
+  const { queries, agentTasks } = runtime;
   const server = new McpServer({
     name: "codex-session-mcp",
     version: "0.1.0"
@@ -39,7 +26,7 @@ export async function createServer(options: { codexHome?: string; indexDbPath?: 
 
   registerJsonTool(server, "codex_session_status", {
     title: "Codex Session Index Status",
-    description: "Return indexing, writer lease, and database status for the local Codex session index.",
+    description: "Return shared backend and indexing status for the local Codex session index.",
     inputSchema: {}
   }, async () => queries.status());
 
@@ -199,8 +186,7 @@ export async function createServer(options: { codexHome?: string; indexDbPath?: 
     }
   }, async (args) => queries.keywordSearch(args));
 
-  indexer.start();
-  return { server, indexer };
+  return server;
 }
 
 function registerJsonTool(
@@ -246,30 +232,8 @@ function registerJsonTool(
 }
 
 async function main(): Promise<void> {
-  const { server, indexer } = await createServer({
-    codexHome: process.env.CODEX_HOME,
-    indexDbPath: process.env.CODEX_SESSION_MCP_DB,
-    busyTimeoutMs: parseBusyTimeout(process.env.CODEX_SESSION_MCP_BUSY_TIMEOUT_MS)
-  });
-  const transport = new StdioServerTransport();
-  let shuttingDown = false;
-  const shutdown = (code: number) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    void indexer.stop().finally(() => process.exit(code));
-  };
-  transport.onclose = () => shutdown(0);
-  process.stdin.on("end", () => shutdown(0));
-  process.stdin.on("close", () => shutdown(0));
-  process.on("SIGINT", () => shutdown(0));
-  process.on("SIGTERM", () => shutdown(0));
-  await server.connect(transport);
-}
-
-function parseBusyTimeout(value: string | undefined): number | undefined {
-  if (!value) return undefined;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+  const { runStdioBridge } = await import("./stdio-bridge.js");
+  await runStdioBridge();
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {

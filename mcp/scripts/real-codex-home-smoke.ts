@@ -22,10 +22,7 @@ ensureDir(path.dirname(dbPath));
 
 const paths = resolveRuntimePaths({ codexHome, indexDbPath: dbPath });
 const db = openDatabase(paths.indexDbPath);
-const indexer = new CodexSessionIndexer(db, paths, {
-  holderId: `real-smoke-${process.pid}`,
-  runSyncInProcess: true
-});
+const indexer = new CodexSessionIndexer(db, paths);
 const queries = new CodexSessionQueries({ db, indexer, waitForIdleMs: 1_000 });
 
 try {

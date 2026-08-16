@@ -42,6 +42,8 @@ Successful task retrievals are indexed as `published_task_retrieval` inputs. Aft
 
 ## Storage and safety
 
-Session JSONL files are read-only source data. The MCP writes only its SQLite mirror and lease state under `~/.codex/session-mcp/` by default. Set `CODEX_HOME` or `CODEX_SESSION_MCP_DB` to override the default locations.
+Session JSONL files are read-only source data. The MCP writes only its SQLite mirror under `~/.codex/session-mcp/` by default. Set `CODEX_HOME` or `CODEX_SESSION_MCP_DB` to override the default locations.
+
+Codex still launches the plugin through stdio. Each stdio process holds one loopback HTTP connection to a shared backend; the first process starts it and concurrent starters let fixed-port binding choose the winner. That backend is the sole SQLite/indexer owner. Stdio processes reconnect after a backend restart, and the backend exits after 60 seconds with no connected stdio clients.
 
 Standalone MCP development details are in [`mcp/README.md`](mcp/README.md).

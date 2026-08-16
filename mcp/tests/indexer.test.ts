@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -40,7 +39,7 @@ class ManualScheduler {
     this.callbacks.delete(handle);
   }
 
-  renewAll(): void {
+  runAll(): void {
     for (const callback of [...this.callbacks.values()]) callback();
   }
 }
@@ -274,62 +273,30 @@ test("archive scope follows session file moves and deletions", async (t) => {
   assert.deepEqual((afterDeleteArchived.data as any).sessions.map((session: any) => session.id), ["archived-session"]);
 });
 
-test("indexer startup survives a locked sqlite writer and reports sync failure", async (t) => {
+test("periodic polling indexes appended JSONL bytes even when mtime does not change", async (t) => {
   const env = createFixtureHome(t);
-  const setupDb = openDatabase(env.dbPath, { busyTimeoutMs: 20 });
-  setupDb.close();
-
-  const blocker = new Database(env.dbPath, { timeout: 20 });
-  blocker.pragma("busy_timeout = 20");
-  blocker.exec("BEGIN IMMEDIATE");
-  env.defer(() => {
-    if (!blocker.open) return;
-    blocker.exec("ROLLBACK");
-    blocker.close();
-  });
-
-  const paths = resolveRuntimePaths({ codexHome: env.codexHome, indexDbPath: env.dbPath });
-  const db = openDatabase(paths.indexDbPath, { busyTimeoutMs: 20 });
-  deferDatabase(env, db);
-  const indexer = new CodexSessionIndexer(db, paths);
-  env.defer(() => indexer.stop());
-
-  assert.doesNotThrow(() => indexer.start());
-  await assert.rejects(() => indexer.sync({ force: true }), /SQLite index database is locked/);
-});
-
-test("indexer stop releases its leader lease", async (t) => {
-  const env = createFixtureHome(t);
-  const { db, indexer } = openFixture(env);
-  indexer.start();
-  assert.equal(indexer.status().is_leader, true);
-
-  await indexer.stop();
-  const lease = db.prepare("SELECT * FROM leader_lease WHERE holder_id = ?").get(indexer.holderId);
-  assert.equal(lease, undefined);
-});
-
-test("leader renewal does not start another sync", async (t) => {
-  const env = createFixtureHome(t);
+  const sessionId = "polling-session";
+  const filePath = path.join(env.activeDir, "polling.jsonl");
+  writeMiniSession(filePath, sessionId, "before polling append");
   const scheduler = new ManualScheduler();
-  let countingIndexer: CountingIndexer | undefined;
-  const { indexer } = openFixture(env, {
+  const { db, indexer } = openFixture(env, {
     createIndexer(db) {
-      countingIndexer = new CountingIndexer(db, runtimePaths(env), {
-        runSyncInProcess: true,
-        scheduler
-      });
-      return countingIndexer;
+      return new CountingIndexer(db, runtimePaths(env), { scheduler });
     }
   });
 
   indexer.start();
   assert.equal(await indexer.waitForIdle(1_000), true);
-  assert.equal(countingIndexer?.syncCalls, 1);
+  const originalTimes = fs.statSync(filePath);
+  appendLines(filePath, [messageLine("user", "appended without mtime")]);
+  fs.utimesSync(filePath, originalTimes.atime, originalTimes.mtime);
 
-  scheduler.renewAll();
-  scheduler.renewAll();
-  assert.equal(countingIndexer?.syncCalls, 1);
+  scheduler.runAll();
+  assert.equal(await indexer.waitForIdle(1_000), true);
+  const texts = db
+    .prepare("SELECT content_text FROM messages WHERE session_id = ? ORDER BY sequence")
+    .all(sessionId) as Array<{ content_text: string }>;
+  assert.deepEqual(texts.map((row) => row.content_text), ["before polling append", "appended without mtime"]);
 });
 
 test("query readiness starts at most one sync per check interval", async (t) => {
@@ -340,7 +307,6 @@ test("query readiness starts at most one sync per check interval", async (t) => 
   const { queries, indexer } = openFixture(env, {
     createIndexer(db) {
       countingIndexer = new CountingIndexer(db, runtimePaths(env), {
-        runSyncInProcess: true,
         syncCheckIntervalMs: 60_000,
         nowMs: () => now
       });
