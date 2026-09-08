@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { CodexSessionMeta, MessageRole } from "./types.js";
-import { jsonString, normalizeRole, safeJsonParse, textFromContent } from "./util.js";
+import { isCrossThreadInputEnvelope, jsonString, normalizeRole, safeJsonParse, textFromContent } from "./util.js";
 
 export interface ParsedRawEvent {
   lineNo: number;
@@ -23,7 +23,6 @@ export interface ParsedMessage {
   timestamp: string | null;
   role: MessageRole;
   contentText: string;
-  contentJson: string | null;
   rawLineNo: number;
   turnId: string | null;
 }
@@ -74,7 +73,8 @@ export function parseSessionFile(filePath: string, endByte = fs.statSync(filePat
     ...parsed,
     meta: parsed.meta ?? {
       id: deriveSessionIdFromFile(filePath),
-      timestamp: parsed.rawEvents[0]?.timestamp ?? undefined
+      timestamp: parsed.rawEvents[0]?.timestamp ?? undefined,
+      history_mode: "legacy"
     }
   };
 }
@@ -107,7 +107,8 @@ export function parseSessionChunk(
   const toolCalls: ParsedToolCall[] = [];
   const toolOutputs: ParsedToolOutput[] = [];
   let meta: CodexSessionMeta | undefined;
-  let sequence = options.startSequence;
+  let lineNo = options.startSequence;
+  let fallbackSequence = options.startSequence;
   let currentTurnId = options.currentTurnId;
   let lineStart = 0;
   let indexedLength = 0;
@@ -126,8 +127,10 @@ export function parseSessionChunk(
       return;
     }
 
-    sequence += 1;
+    lineNo += 1;
+    fallbackSequence += 1;
     const record = parsed as Record<string, unknown>;
+    const sequence = nonNegativeInteger(record.ordinal) ?? fallbackSequence;
     const payload = asRecord(record.payload);
     const eventType = stringValue(record.type) ?? "unknown";
     const payloadType = stringValue(payload.type) ?? null;
@@ -137,7 +140,7 @@ export function parseSessionChunk(
       currentTurnId = stringValue(payload.turn_id) ?? currentTurnId;
     }
     const raw: ParsedRawEvent = {
-      lineNo: sequence,
+      lineNo,
       sequence,
       byteStart: options.startByte + lineStart,
       byteLength: Buffer.byteLength(rawJson, "utf8"),
@@ -180,7 +183,6 @@ export function parseSessionChunk(
         timestamp,
         role: normalizeRole(role),
         contentText,
-        contentJson: content === undefined ? null : jsonString(content),
         rawLineNo: raw.lineNo,
         turnId: currentTurnId
       });
@@ -207,6 +209,27 @@ export function parseSessionChunk(
       });
       finish();
       return;
+    }
+
+    if (
+      payloadType === "function_call_output" &&
+      stringValue(payload.namespace) === "codex_app" &&
+      stringValue(payload.name) === "send_message_to_thread" &&
+      stringValue(payload.call_id) === undefined
+    ) {
+      const contentText = textFromContent(payload.output);
+      if (isCrossThreadInputEnvelope(contentText)) {
+        messages.push({
+          sequence,
+          timestamp,
+          role: "user",
+          contentText,
+          rawLineNo: raw.lineNo,
+          turnId: currentTurnId
+        });
+        finish();
+        return;
+      }
     }
 
     if (payloadType === "function_call_output" || payloadType === "custom_tool_call_output") {
@@ -249,7 +272,7 @@ export function parseSessionChunk(
     messages,
     toolCalls,
     toolOutputs,
-    lineCount: sequence,
+    lineCount: lineNo,
     indexedBytes: options.startByte + indexedLength,
     currentTurnId
   };
@@ -271,16 +294,34 @@ function normalizeTimestamp(value: string | undefined): string | null {
 }
 
 function extractMeta(payload: Record<string, unknown>): CodexSessionMeta {
+  const historyBase = asRecord(payload.history_base);
+  const baseRolloutId = stringValue(historyBase.thread_id);
+  const baseEndOrdinal = nonNegativeInteger(historyBase.end_ordinal_exclusive);
+  const baseEndByteOffset = nonNegativeInteger(historyBase.end_byte_offset);
   return {
     id: stringValue(payload.id) ?? "",
+    session_id: stringValue(payload.session_id),
     forked_from_id: stringValue(payload.forked_from_id),
+    parent_thread_id: stringValue(payload.parent_thread_id),
     timestamp: stringValue(payload.timestamp),
     cwd: stringValue(payload.cwd),
     originator: stringValue(payload.originator),
     cli_version: stringValue(payload.cli_version),
     source: stringValue(payload.source),
-    thread_source: stringValue(payload.thread_source)
+    thread_source: stringValue(payload.thread_source),
+    history_mode: payload.history_mode === "paginated" ? "paginated" : "legacy",
+    history_base: baseRolloutId !== undefined && baseEndOrdinal !== undefined && baseEndByteOffset !== undefined
+      ? {
+          thread_id: baseRolloutId,
+          end_ordinal_exclusive: baseEndOrdinal,
+          end_byte_offset: baseEndByteOffset
+        }
+      : undefined
   };
+}
+
+function nonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
 function deriveSessionIdFromFile(filePath: string): string {

@@ -45,25 +45,23 @@ class StdioBridge {
   private readonly responseBuffer = new ReadBuffer();
   private readonly queue: JSONRPCMessage[] = [];
   private readonly outstanding = new Map<string, JSONRPCMessage>();
+  private resolveDone!: () => void;
+  private rejectDone!: (error: Error) => void;
   private readonly done = new Promise<void>((resolve, reject) => {
     this.resolveDone = resolve;
     this.rejectDone = reject;
   });
-  private resolveDone!: () => void;
-  private rejectDone!: (error: Error) => void;
   private request: ClientRequest | undefined;
   private response: IncomingMessage | undefined;
   private reconnectTimer: NodeJS.Timeout | undefined;
   private connecting = false;
   private flushing = false;
   private stopped = false;
-  private hasConnected = false;
   private protocolReady = false;
   private initializeRequest: JSONRPCMessage | undefined;
   private initializeResponseSeen = false;
   private initializedNotification: JSONRPCMessage | undefined;
   private internalInitializeId: string | undefined;
-  private readonly initialConnectDeadline = Date.now() + this.configuration.startupTimeoutMs;
 
   async run(): Promise<void> {
     process.stdin.on("data", this.handleStdinData);
@@ -119,7 +117,6 @@ class StdioBridge {
         return;
       }
       this.attachConnection(connection);
-      this.hasConnected = true;
       if (this.initializeResponseSeen && this.initializeRequest) {
         await this.restoreProtocolSession();
       } else {
@@ -127,7 +124,7 @@ class StdioBridge {
         await this.flushQueue();
       }
     } catch (error) {
-      if (isIncompatible(error) || (!this.hasConnected && Date.now() >= this.initialConnectDeadline)) {
+      if (isIncompatible(error)) {
         this.fail(asError(error));
       } else if (this.request) {
         this.connectionLost(this.request, asError(error));
@@ -312,9 +309,11 @@ class StdioBridge {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
     const request = this.request;
+    const response = this.response;
     this.request = undefined;
     this.response = undefined;
     if (request && !request.destroyed) request.end();
+    if (response && !response.destroyed) response.destroy();
     this.stdinBuffer.clear();
     this.responseBuffer.clear();
     process.stdin.off("data", this.handleStdinData);

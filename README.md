@@ -23,7 +23,7 @@ The plugin MCP manifest uses paths relative to the plugin root, so the built rep
 
 `codex_session_publish_task` stores an exact instruction and returns a ready-to-send `prompt`. Send that prompt verbatim to the receiving agent. The agent retrieves the instruction with `codex_session_get_task`; later instruction updates use the same publish-and-prompt flow.
 
-Successful task retrievals are indexed as `published_task_retrieval` inputs. After compression, `codex_session_recent_user_inputs` recovers both ordinary user messages and retrieved agent instructions without conflating their types.
+Successful task retrievals are indexed as `published_task_retrieval` inputs. After compression, `codex_session_recent_user_inputs` recovers ordinary user messages, cross-thread messages, and retrieved agent instructions without conflating their types.
 
 ## MCP tools
 

@@ -89,6 +89,60 @@ test("compression recovery locates a session and returns its latest effective in
   );
 });
 
+test("cross-thread messages remain effective inputs across both Codex JSONL encodings", async (t) => {
+  const env = createFixtureHome(t);
+  const sessionId = "cross-thread-input-session";
+  const sourceId = "11111111-2222-4333-8444-555555555555";
+  const legacyEnvelope = `<codex_delegation>\n  <source_thread_id>${sourceId}</source_thread_id>\n  <input>legacy instruction</input>\n</codex_delegation>`;
+  const currentEnvelope = `<codex_delegation>\n  <source_thread_id>${sourceId}</source_thread_id>\n  <input>current reply</input>\n</codex_delegation>`;
+  fs.writeFileSync(
+    path.join(env.activeDir, "cross-thread.jsonl"),
+    [
+      {
+        timestamp: "2026-06-07T00:00:00.000Z",
+        type: "session_meta",
+        payload: { id: sessionId, timestamp: "2026-06-07T00:00:00.000Z" }
+      },
+      {
+        timestamp: "2026-06-07T00:00:01.000Z",
+        type: "response_item",
+        payload: { type: "message", role: "user", content: [{ type: "input_text", text: legacyEnvelope }] }
+      },
+      {
+        timestamp: "2026-06-07T00:00:02.000Z",
+        type: "response_item",
+        payload: {
+          type: "function_call_output",
+          id: "current-cross-thread-output",
+          namespace: "codex_app",
+          name: "send_message_to_thread",
+          output: currentEnvelope
+        }
+      },
+      {
+        timestamp: "2026-06-07T00:00:03.000Z",
+        type: "response_item",
+        payload: { type: "message", role: "user", content: [{ type: "input_text", text: "ordinary input" }] }
+      }
+    ].map((line) => JSON.stringify(line)).join("\n") + "\n",
+    "utf8"
+  );
+  const { queries, indexer } = openFixture(env);
+  await indexer.sync({ rebuild: true, force: true });
+
+  const recent = await queries.recentUserInputs({ session_id: sessionId, limit: 3 });
+  assert.deepEqual(
+    (recent.data as any).inputs.map((input: any) => [input.input_type, input.content_text]),
+    [
+      ["user_message", "ordinary input"],
+      ["cross_thread_message", currentEnvelope],
+      ["cross_thread_message", legacyEnvelope]
+    ]
+  );
+  const located = await queries.findByText({ text: "current reply" });
+  assert.equal((located.data as any).match.input_type, "cross_thread_message");
+});
+
 test("context drill-down queries preserve filtering and raw-data boundaries", async (t) => {
   const env = createFixtureHome(t);
   const sessionId = "context-drill-down-session";

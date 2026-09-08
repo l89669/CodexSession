@@ -6,6 +6,9 @@
         "./mcp/dist/src/server.js"
       ],
       "cwd": ".",
+      "env": {
+        "CODEX_SESSION_MCP_CONNECTION_GENERATION": "rollout-v9"
+      },
       "startup_timeout_sec": 20
     }
   }

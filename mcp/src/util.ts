@@ -81,6 +81,13 @@ export function textFromContent(content: unknown): string {
   return parts.join("\n").replace(/\r\n/g, "\n").trim();
 }
 
+export function isCrossThreadInputEnvelope(value: string | null | undefined): boolean {
+  const text = value?.trimStart() ?? "";
+  return text.startsWith("<codex_delegation>") &&
+    text.includes("<source_thread_id>") &&
+    text.includes("<input>");
+}
+
 function collectText(value: unknown, parts: string[]): void {
   if (value === null || value === undefined) return;
   if (typeof value === "string") {
@@ -148,4 +155,3 @@ export function nonEmptyKeywords(keywords: string[] | undefined, single?: string
     .filter((item) => item.length > 0);
   return [...new Set(all)];
 }
-

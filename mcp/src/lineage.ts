@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { ParsedRawEvent, ParsedSessionFile } from "./parser.js";
 
 export interface ForkLineageAnalysis {
-  parentSessionId: string;
+  parentRolloutId: string;
   replayParentSequence: number;
   localStartSequence: number;
   sequenceOffset: number;
@@ -21,7 +21,8 @@ interface TurnRange {
 
 export function analyzeForkLineage(
   child: ParsedSessionFile,
-  parent: ParsedSessionFile
+  parent: ParsedSessionFile,
+  parentRolloutId = parent.meta.id
 ): ForkLineageAnalysis | undefined {
   if (!child.meta.forked_from_id || child.meta.forked_from_id !== parent.meta.id) return undefined;
   if (child.rawEvents.length < 2 || parent.rawEvents.length === 0) return undefined;
@@ -68,7 +69,7 @@ export function analyzeForkLineage(
     : undefined;
 
   return {
-    parentSessionId: parent.meta.id,
+    parentRolloutId,
     replayParentSequence: replayed,
     localStartSequence,
     sequenceOffset: child.rawEvents[1].sequence - parent.rawEvents[0].sequence,

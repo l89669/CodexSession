@@ -3,16 +3,27 @@ export type SortOrder = "asc" | "desc";
 export type MessageRole = "user" | "assistant" | "developer" | "system" | "tool" | "unknown";
 export type SearchScope = "messages" | "tool_calls" | "tool_outputs" | "raw_events" | "all";
 export type KeywordMatch = "any" | "all";
+export type ThreadHistoryMode = "legacy" | "paginated";
+
+export interface CodexHistoryPosition {
+  thread_id: string;
+  end_ordinal_exclusive: number;
+  end_byte_offset: number;
+}
 
 export interface CodexSessionMeta {
   id: string;
+  session_id?: string;
   forked_from_id?: string;
+  parent_thread_id?: string;
   timestamp?: string;
   cwd?: string;
   originator?: string;
   cli_version?: string;
   source?: string;
   thread_source?: string;
+  history_mode: ThreadHistoryMode;
+  history_base?: CodexHistoryPosition;
 }
 
 export interface SessionFile {
@@ -24,16 +35,17 @@ export interface SessionFile {
 
 export interface MessageRow {
   session_id: string;
+  rollout_id: string;
   sequence: number;
   timestamp: string | null;
   role: MessageRole;
   content_text: string;
-  content_json: string | null;
   raw_event_id: number;
 }
 
 export interface ToolCallRow {
   session_id: string;
+  rollout_id: string;
   sequence: number;
   timestamp: string | null;
   call_id: string;

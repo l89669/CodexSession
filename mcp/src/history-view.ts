@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { Db } from "./db.js";
 
 export interface HistorySegment {
-  sessionId: string;
+  rolloutId: string;
   minSequence: number;
   maxSequence: number | null;
   sequenceOffset: number;
@@ -14,8 +14,8 @@ export interface SessionHistoryView {
   parentHistoryStatus?: "included" | "boundary_mismatch";
 }
 
-interface LineageRow {
-  parent_session_id: string;
+interface HistoryRow {
+  base_rollout_id: string;
   local_start_sequence: number;
   sequence_offset: number;
   parent_cutoff_sequence: number;
@@ -25,91 +25,102 @@ interface LineageRow {
 }
 
 export function resolveSessionHistory(db: Db, sessionId: string): SessionHistoryView {
-  const visited = new Set<string>();
-  const resolved = resolve(db, sessionId, null, 0, visited);
+  const session = db
+    .prepare("SELECT current_rollout_id FROM sessions WHERE session_id = ?")
+    .get(sessionId) as { current_rollout_id: string | null } | undefined;
+  if (!session?.current_rollout_id) return { segments: [] };
+
+  const resolved = resolve(db, session.current_rollout_id, null, 0, new Set());
   return {
     segments: resolved.segments,
-    ...(resolved.hasLineage ? { parentHistoryStatus: resolved.boundaryValid ? "included" : "boundary_mismatch" } : {})
+    ...(resolved.hasHistory
+      ? { parentHistoryStatus: resolved.boundaryValid ? "included" : "boundary_mismatch" }
+      : {})
   };
 }
 
 function resolve(
   db: Db,
-  sessionId: string,
+  rolloutId: string,
   maxSequence: number | null,
   targetOffset: number,
   visited: Set<string>
-): { segments: HistorySegment[]; hasLineage: boolean; boundaryValid: boolean } {
-  if (visited.has(sessionId)) {
+): { segments: HistorySegment[]; hasHistory: boolean; boundaryValid: boolean } {
+  const rollout = db
+    .prepare("SELECT first_sequence FROM rollouts WHERE rollout_id = ?")
+    .get(rolloutId) as { first_sequence: number } | undefined;
+  if (!rollout) return { segments: [], hasHistory: false, boundaryValid: false };
+  if (visited.has(rolloutId)) {
     return {
-      segments: [segment(sessionId, 1, maxSequence, targetOffset)],
-      hasLineage: false,
-      boundaryValid: true
+      segments: [segment(rolloutId, rollout.first_sequence, maxSequence, targetOffset)],
+      hasHistory: false,
+      boundaryValid: false
     };
   }
-  visited.add(sessionId);
+
+  visited.add(rolloutId);
   try {
-    const lineage = db
+    const history = db
       .prepare(
-        `SELECT parent_session_id, local_start_sequence, sequence_offset, parent_cutoff_sequence,
+        `SELECT base_rollout_id, local_start_sequence, sequence_offset, parent_cutoff_sequence,
                 boundary_byte_start, boundary_byte_length, boundary_hash
-         FROM session_lineage
-         WHERE session_id = ?`
+         FROM rollout_history
+         WHERE rollout_id = ?`
       )
-      .get(sessionId) as LineageRow | undefined;
-    if (!lineage) {
+      .get(rolloutId) as HistoryRow | undefined;
+    if (!history) {
       return {
-        segments: maxSequence !== null && maxSequence < 1
+        segments: maxSequence !== null && maxSequence < rollout.first_sequence
           ? []
-          : [segment(sessionId, 1, maxSequence, targetOffset)],
-        hasLineage: false,
+          : [segment(rolloutId, rollout.first_sequence, maxSequence, targetOffset)],
+        hasHistory: false,
         boundaryValid: true
       };
     }
 
     const translatedMax = maxSequence === null
-      ? lineage.parent_cutoff_sequence
-      : Math.min(lineage.parent_cutoff_sequence, maxSequence - lineage.sequence_offset);
-    const boundaryValid = validateBoundary(db, lineage);
-    const parent = boundaryValid && translatedMax >= 1
+      ? history.parent_cutoff_sequence
+      : Math.min(history.parent_cutoff_sequence, maxSequence - history.sequence_offset);
+    const boundaryValid = validateBoundary(db, history);
+    const parent = boundaryValid
       ? resolve(
           db,
-          lineage.parent_session_id,
+          history.base_rollout_id,
           translatedMax,
-          targetOffset + lineage.sequence_offset,
+          targetOffset + history.sequence_offset,
           visited
         )
-      : { segments: [], hasLineage: false, boundaryValid };
-    const includeLocal = maxSequence === null || maxSequence >= lineage.local_start_sequence;
+      : { segments: [], hasHistory: false, boundaryValid: false };
+    const includeLocal = maxSequence === null || maxSequence >= history.local_start_sequence;
     const local = includeLocal
-      ? [segment(sessionId, lineage.local_start_sequence, maxSequence, targetOffset)]
+      ? [segment(rolloutId, history.local_start_sequence, maxSequence, targetOffset)]
       : [];
     return {
       segments: [...parent.segments, ...local],
-      hasLineage: true,
+      hasHistory: true,
       boundaryValid: boundaryValid && parent.boundaryValid
     };
   } finally {
-    visited.delete(sessionId);
+    visited.delete(rolloutId);
   }
 }
 
-function validateBoundary(db: Db, lineage: LineageRow): boolean {
-  if (lineage.parent_cutoff_sequence === 0 && lineage.boundary_hash === null) return true;
+function validateBoundary(db: Db, history: HistoryRow): boolean {
+  if (history.parent_cutoff_sequence <= 0 && history.boundary_hash === null) return true;
   if (
-    lineage.boundary_byte_start === null ||
-    lineage.boundary_byte_length === null ||
-    lineage.boundary_hash === null
+    history.boundary_byte_start === null ||
+    history.boundary_byte_length === null ||
+    history.boundary_hash === null
   ) {
     return false;
   }
-  const parent = db
-    .prepare("SELECT file_path FROM sessions WHERE session_id = ?")
-    .get(lineage.parent_session_id) as { file_path: string } | undefined;
-  if (!parent || !fs.existsSync(parent.file_path)) return false;
+  const base = db
+    .prepare("SELECT file_path FROM rollouts WHERE rollout_id = ?")
+    .get(history.base_rollout_id) as { file_path: string } | undefined;
+  if (!base || !fs.existsSync(base.file_path)) return false;
 
-  const buffer = Buffer.allocUnsafe(lineage.boundary_byte_length);
-  const handle = fs.openSync(parent.file_path, "r");
+  const buffer = Buffer.allocUnsafe(history.boundary_byte_length);
+  const handle = fs.openSync(base.file_path, "r");
   let read = 0;
   try {
     while (read < buffer.length) {
@@ -118,7 +129,7 @@ function validateBoundary(db: Db, lineage: LineageRow): boolean {
         buffer,
         read,
         buffer.length - read,
-        lineage.boundary_byte_start + read
+        history.boundary_byte_start + read
       );
       if (count === 0) break;
       read += count;
@@ -127,15 +138,14 @@ function validateBoundary(db: Db, lineage: LineageRow): boolean {
     fs.closeSync(handle);
   }
   if (read !== buffer.length) return false;
-  return crypto.createHash("sha256").update(buffer).digest("hex") === lineage.boundary_hash;
+  return crypto.createHash("sha256").update(buffer).digest("hex") === history.boundary_hash;
 }
 
 function segment(
-  sessionId: string,
+  rolloutId: string,
   minSequence: number,
   maxSequence: number | null,
   sequenceOffset: number
 ): HistorySegment {
-  return { sessionId, minSequence, maxSequence, sequenceOffset };
+  return { rolloutId, minSequence, maxSequence, sequenceOffset };
 }
-

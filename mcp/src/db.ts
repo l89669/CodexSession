@@ -1,10 +1,11 @@
 import Database from "better-sqlite3";
-import { ensureDir } from "./util.js";
 import path from "node:path";
+import { ensureDir } from "./util.js";
 
 export type Db = Database.Database;
 
-export const INDEX_SCHEMA_VERSION = 7;
+export const INDEX_SCHEMA_VERSION = 10;
+const MIN_INCREMENTAL_MIGRATION_VERSION = 9;
 
 export function openDatabase(dbPath: string, options: { busyTimeoutMs?: number } = {}): Db {
   ensureDir(path.dirname(dbPath));
@@ -35,10 +36,15 @@ export function isSqliteBusy(error: unknown): boolean {
 }
 
 export function migrate(db: Db): void {
+  const version = db.pragma("user_version", { simple: true }) as number;
+  if (version > 0 && version < MIN_INCREMENTAL_MIGRATION_VERSION) {
+    resetDerivedIndex(db);
+  }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS sessions (
       session_id TEXT PRIMARY KEY,
-      file_path TEXT NOT NULL UNIQUE,
+      current_rollout_id TEXT,
       archive_scope TEXT NOT NULL CHECK (archive_scope IN ('active', 'archived')),
       forked_from_id TEXT,
       created_at TEXT,
@@ -48,59 +54,83 @@ export function migrate(db: Db): void {
       meta_json TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS session_files (
-      file_path TEXT PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS rollouts (
+      rollout_id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,
+      file_path TEXT NOT NULL UNIQUE,
       archive_scope TEXT NOT NULL CHECK (archive_scope IN ('active', 'archived')),
+      history_mode TEXT NOT NULL CHECK (history_mode IN ('legacy', 'paginated')),
+      first_sequence INTEGER NOT NULL,
       size INTEGER NOT NULL,
       mtime_ms REAL NOT NULL,
       line_count INTEGER NOT NULL,
-      indexed_bytes INTEGER,
-      boundary_hash TEXT,
+      indexed_bytes INTEGER NOT NULL,
+      boundary_hash TEXT NOT NULL,
       current_turn_id TEXT,
-      index_version INTEGER NOT NULL DEFAULT 1,
+      index_version INTEGER NOT NULL,
       indexed_at TEXT NOT NULL,
+      UNIQUE (rollout_id, session_id),
       FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS rollout_history (
+      rollout_id TEXT PRIMARY KEY,
+      base_rollout_id TEXT NOT NULL,
+      replay_parent_sequence INTEGER,
+      local_start_sequence INTEGER NOT NULL,
+      sequence_offset INTEGER NOT NULL,
+      parent_cutoff_sequence INTEGER NOT NULL,
+      base_end_byte_offset INTEGER,
+      boundary_byte_start INTEGER,
+      boundary_byte_length INTEGER,
+      boundary_hash TEXT,
+      source TEXT NOT NULL CHECK (source IN ('history_base', 'legacy_fork')),
+      FOREIGN KEY (rollout_id) REFERENCES rollouts(rollout_id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS raw_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
-      file_path TEXT NOT NULL,
+      rollout_id TEXT NOT NULL,
       line_no INTEGER NOT NULL,
       sequence INTEGER NOT NULL,
       timestamp TEXT,
       event_type TEXT NOT NULL,
       payload_type TEXT,
       role TEXT,
-      byte_start INTEGER,
-      byte_length INTEGER,
+      byte_start INTEGER NOT NULL,
+      byte_length INTEGER NOT NULL,
       raw_json TEXT NOT NULL,
-      FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+      UNIQUE (rollout_id, line_no),
+      FOREIGN KEY (rollout_id, session_id)
+        REFERENCES rollouts(rollout_id, session_id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS session_turns (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
+      rollout_id TEXT NOT NULL,
       turn_id TEXT NOT NULL,
       start_sequence INTEGER NOT NULL,
       end_sequence INTEGER,
       rewound INTEGER NOT NULL DEFAULT 0 CHECK (rewound IN (0, 1)),
-      UNIQUE (session_id, turn_id),
-      FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+      UNIQUE (rollout_id, turn_id),
+      FOREIGN KEY (rollout_id, session_id)
+        REFERENCES rollouts(rollout_id, session_id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
+      rollout_id TEXT NOT NULL,
       sequence INTEGER NOT NULL,
       timestamp TEXT,
       role TEXT NOT NULL,
       content_text TEXT NOT NULL,
-      content_json TEXT,
       turn_ref INTEGER,
       raw_event_id INTEGER NOT NULL,
-      FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+      FOREIGN KEY (rollout_id, session_id)
+        REFERENCES rollouts(rollout_id, session_id) ON DELETE CASCADE,
       FOREIGN KEY (turn_ref) REFERENCES session_turns(id) ON DELETE CASCADE,
       FOREIGN KEY (raw_event_id) REFERENCES raw_events(id) ON DELETE CASCADE
     );
@@ -108,6 +138,7 @@ export function migrate(db: Db): void {
     CREATE TABLE IF NOT EXISTS tool_calls (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
+      rollout_id TEXT NOT NULL,
       sequence INTEGER NOT NULL,
       timestamp TEXT,
       call_id TEXT NOT NULL,
@@ -120,7 +151,8 @@ export function migrate(db: Db): void {
       turn_ref INTEGER,
       call_raw_event_id INTEGER NOT NULL,
       output_raw_event_id INTEGER,
-      FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+      FOREIGN KEY (rollout_id, session_id)
+        REFERENCES rollouts(rollout_id, session_id) ON DELETE CASCADE,
       FOREIGN KEY (turn_ref) REFERENCES session_turns(id) ON DELETE CASCADE,
       FOREIGN KEY (call_raw_event_id) REFERENCES raw_events(id) ON DELETE CASCADE,
       FOREIGN KEY (output_raw_event_id) REFERENCES raw_events(id) ON DELETE SET NULL
@@ -129,6 +161,7 @@ export function migrate(db: Db): void {
     CREATE TABLE IF NOT EXISTS session_locator_tokens (
       token TEXT NOT NULL,
       session_id TEXT NOT NULL,
+      rollout_id TEXT NOT NULL,
       archive_scope TEXT NOT NULL CHECK (archive_scope IN ('active', 'archived')),
       sequence INTEGER NOT NULL,
       timestamp TEXT,
@@ -137,8 +170,9 @@ export function migrate(db: Db): void {
       source TEXT NOT NULL CHECK (source IN ('tool_arguments', 'tool_output')),
       raw_event_id INTEGER,
       indexed_at TEXT NOT NULL,
-      PRIMARY KEY (token, session_id, sequence, source),
-      FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+      PRIMARY KEY (token, rollout_id, sequence, source),
+      FOREIGN KEY (rollout_id, session_id)
+        REFERENCES rollouts(rollout_id, session_id) ON DELETE CASCADE,
       FOREIGN KEY (raw_event_id) REFERENCES raw_events(id) ON DELETE SET NULL
     );
 
@@ -151,6 +185,7 @@ export function migrate(db: Db): void {
 
     CREATE TABLE IF NOT EXISTS session_task_inputs (
       session_id TEXT NOT NULL,
+      rollout_id TEXT NOT NULL,
       sequence INTEGER NOT NULL,
       timestamp TEXT,
       call_id TEXT,
@@ -159,25 +194,11 @@ export function migrate(db: Db): void {
       task_text TEXT NOT NULL,
       turn_ref INTEGER,
       raw_event_id INTEGER NOT NULL,
-      PRIMARY KEY (session_id, sequence),
-      FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+      PRIMARY KEY (rollout_id, sequence),
+      FOREIGN KEY (rollout_id, session_id)
+        REFERENCES rollouts(rollout_id, session_id) ON DELETE CASCADE,
       FOREIGN KEY (turn_ref) REFERENCES session_turns(id) ON DELETE CASCADE,
       FOREIGN KEY (raw_event_id) REFERENCES raw_events(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS session_lineage (
-      session_id TEXT PRIMARY KEY,
-      parent_session_id TEXT NOT NULL,
-      replay_parent_sequence INTEGER NOT NULL,
-      local_start_sequence INTEGER NOT NULL,
-      sequence_offset INTEGER NOT NULL,
-      parent_cutoff_sequence INTEGER NOT NULL,
-      boundary_message_sequence INTEGER,
-      boundary_byte_start INTEGER,
-      boundary_byte_length INTEGER,
-      boundary_hash TEXT,
-      indexed_at TEXT NOT NULL,
-      FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS sync_status (
@@ -193,95 +214,108 @@ export function migrate(db: Db): void {
 
     CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
     CREATE INDEX IF NOT EXISTS idx_sessions_archive ON sessions(archive_scope);
+    CREATE INDEX IF NOT EXISTS idx_rollouts_session ON rollouts(session_id, mtime_ms);
+    CREATE INDEX IF NOT EXISTS idx_rollouts_file ON rollouts(file_path);
+    CREATE INDEX IF NOT EXISTS idx_rollout_history_base ON rollout_history(base_rollout_id);
+    CREATE INDEX IF NOT EXISTS idx_raw_events_rollout_seq ON raw_events(rollout_id, sequence);
     CREATE INDEX IF NOT EXISTS idx_raw_events_session_seq ON raw_events(session_id, sequence);
     CREATE INDEX IF NOT EXISTS idx_raw_events_type ON raw_events(event_type, payload_type);
-    CREATE INDEX IF NOT EXISTS idx_session_turns_session_end ON session_turns(session_id, end_sequence DESC);
-    CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, sequence);
-    CREATE INDEX IF NOT EXISTS idx_messages_role ON messages(session_id, role);
+    CREATE INDEX IF NOT EXISTS idx_session_turns_rollout_end ON session_turns(rollout_id, end_sequence DESC);
+    CREATE INDEX IF NOT EXISTS idx_messages_rollout_seq ON messages(rollout_id, sequence);
+    CREATE INDEX IF NOT EXISTS idx_messages_session_role ON messages(session_id, role);
     CREATE INDEX IF NOT EXISTS idx_messages_raw_event ON messages(raw_event_id);
-    CREATE INDEX IF NOT EXISTS idx_session_files_session ON session_files(session_id);
-    CREATE INDEX IF NOT EXISTS idx_tool_calls_session_seq ON tool_calls(session_id, sequence);
-    CREATE INDEX IF NOT EXISTS idx_tool_calls_name ON tool_calls(session_id, tool_name);
+    CREATE INDEX IF NOT EXISTS idx_messages_turn_ref ON messages(turn_ref);
+    CREATE INDEX IF NOT EXISTS idx_tool_calls_rollout_seq ON tool_calls(rollout_id, sequence);
+    CREATE INDEX IF NOT EXISTS idx_tool_calls_session_name ON tool_calls(session_id, tool_name);
     CREATE INDEX IF NOT EXISTS idx_tool_calls_call_raw_event ON tool_calls(call_raw_event_id);
     CREATE INDEX IF NOT EXISTS idx_tool_calls_output_raw_event ON tool_calls(output_raw_event_id);
+    CREATE INDEX IF NOT EXISTS idx_tool_calls_turn_ref ON tool_calls(turn_ref);
     CREATE INDEX IF NOT EXISTS idx_session_locator_tokens_token ON session_locator_tokens(token);
     CREATE INDEX IF NOT EXISTS idx_session_locator_tokens_session ON session_locator_tokens(session_id, sequence);
-    CREATE INDEX IF NOT EXISTS idx_session_lineage_parent ON session_lineage(parent_session_id);
-  `);
-
-  if (!columnExists(db, "sessions", "forked_from_id")) {
-    db.exec("ALTER TABLE sessions ADD COLUMN forked_from_id TEXT;");
-  }
-  if (!columnExists(db, "agent_tasks", "retrieval_count")) {
-    db.exec("ALTER TABLE agent_tasks ADD COLUMN retrieval_count INTEGER NOT NULL DEFAULT 0;");
-  }
-  if (!columnExists(db, "session_files", "indexed_bytes")) {
-    db.exec("ALTER TABLE session_files ADD COLUMN indexed_bytes INTEGER;");
-  }
-  if (!columnExists(db, "session_files", "boundary_hash")) {
-    db.exec("ALTER TABLE session_files ADD COLUMN boundary_hash TEXT;");
-  }
-  if (!columnExists(db, "session_files", "current_turn_id")) {
-    db.exec("ALTER TABLE session_files ADD COLUMN current_turn_id TEXT;");
-  }
-  if (!columnExists(db, "session_files", "index_version")) {
-    db.exec("ALTER TABLE session_files ADD COLUMN index_version INTEGER NOT NULL DEFAULT 1;");
-  }
-  if (!columnExists(db, "raw_events", "byte_start")) {
-    db.exec("ALTER TABLE raw_events ADD COLUMN byte_start INTEGER;");
-  }
-  if (!columnExists(db, "raw_events", "byte_length")) {
-    db.exec("ALTER TABLE raw_events ADD COLUMN byte_length INTEGER;");
-  }
-  if (!columnExists(db, "messages", "turn_ref")) {
-    db.exec("ALTER TABLE messages ADD COLUMN turn_ref INTEGER REFERENCES session_turns(id) ON DELETE CASCADE;");
-  }
-  if (!columnExists(db, "tool_calls", "turn_ref")) {
-    db.exec("ALTER TABLE tool_calls ADD COLUMN turn_ref INTEGER REFERENCES session_turns(id) ON DELETE CASCADE;");
-  }
-  if (!columnExists(db, "session_task_inputs", "turn_ref")) {
-    db.exec("ALTER TABLE session_task_inputs ADD COLUMN turn_ref INTEGER REFERENCES session_turns(id) ON DELETE CASCADE;");
-  }
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_messages_turn_ref ON messages(turn_ref);
-    CREATE INDEX IF NOT EXISTS idx_tool_calls_turn_ref ON tool_calls(turn_ref);
+    CREATE INDEX IF NOT EXISTS idx_session_task_inputs_session ON session_task_inputs(session_id, sequence);
     CREATE INDEX IF NOT EXISTS idx_session_task_inputs_turn_ref ON session_task_inputs(turn_ref);
   `);
-  db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_forked_from ON sessions(forked_from_id);");
 
-  const version = db.pragma("user_version", { simple: true }) as number;
-  if (version < 1) {
-    db.exec("DELETE FROM sessions;");
-    db.pragma("user_version = 1");
-  }
-  if (version < 2) {
-    db.pragma("user_version = 2");
-  }
-  if (version < 3) {
-    db.pragma("user_version = 3");
-  }
-  if (version < 4) {
-    db.pragma("user_version = 4");
-  }
-  if (version < 5) {
-    db.pragma("user_version = 5");
-  }
-  if (version === 0) {
+  if (version === MIN_INCREMENTAL_MIGRATION_VERSION) {
+    db.exec(`
+      INSERT INTO messages
+        (session_id, rollout_id, sequence, timestamp, role, content_text, turn_ref, raw_event_id)
+      SELECT
+        raw.session_id,
+        raw.rollout_id,
+        raw.sequence,
+        raw.timestamp,
+        'user',
+        json_extract(raw.raw_json, '$.payload.output'),
+        turn.id,
+        raw.id
+      FROM raw_events raw
+      LEFT JOIN session_turns turn
+        ON turn.rollout_id = raw.rollout_id
+       AND turn.turn_id = json_extract(
+         raw.raw_json,
+         '$.payload.internal_chat_message_metadata_passthrough.turn_id'
+       )
+      WHERE raw.event_type = 'response_item'
+        AND raw.payload_type = 'function_call_output'
+        AND json_extract(raw.raw_json, '$.payload.namespace') = 'codex_app'
+        AND json_extract(raw.raw_json, '$.payload.name') = 'send_message_to_thread'
+        AND json_extract(raw.raw_json, '$.payload.call_id') IS NULL
+        AND ltrim(json_extract(raw.raw_json, '$.payload.output')) LIKE '<codex_delegation>%'
+        AND instr(json_extract(raw.raw_json, '$.payload.output'), '<source_thread_id>') > 0
+        AND instr(json_extract(raw.raw_json, '$.payload.output'), '<input>') > 0
+        AND NOT EXISTS (
+          SELECT 1 FROM messages message WHERE message.raw_event_id = raw.id
+        );
+    `);
+    db.pragma(`user_version = ${INDEX_SCHEMA_VERSION}`);
+  } else if (version === 0) {
     db.pragma(`user_version = ${INDEX_SCHEMA_VERSION}`);
   }
 }
 
-function columnExists(db: Db, table: string, column: string): boolean {
-  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-  return rows.some((row) => row.name === column);
+function resetDerivedIndex(db: Db): void {
+  db.exec(`
+    DROP TABLE IF EXISTS session_lineage;
+    DROP TABLE IF EXISTS rollout_history;
+    DROP TABLE IF EXISTS session_task_inputs;
+    DROP TABLE IF EXISTS session_locator_tokens;
+    DROP TABLE IF EXISTS tool_calls;
+    DROP TABLE IF EXISTS messages;
+    DROP TABLE IF EXISTS session_turns;
+    DROP TABLE IF EXISTS raw_events;
+    DROP TABLE IF EXISTS session_files;
+    DROP TABLE IF EXISTS rollouts;
+    DROP TABLE IF EXISTS sync_status;
+    DROP TABLE IF EXISTS sessions;
+  `);
 }
 
 export function deleteFileRows(db: Db, filePath: string): void {
-  const session = db.prepare("SELECT session_id FROM session_files WHERE file_path = ?").get(filePath) as { session_id: string } | undefined;
-  if (!session) return;
-  db.prepare("DELETE FROM sessions WHERE session_id = ?").run(session.session_id);
+  const rollout = db
+    .prepare("SELECT rollout_id, session_id FROM rollouts WHERE file_path = ?")
+    .get(filePath) as { rollout_id: string; session_id: string } | undefined;
+  if (!rollout) return;
+  db.prepare("DELETE FROM rollouts WHERE rollout_id = ?").run(rollout.rollout_id);
+  deleteSessionIfEmpty(db, rollout.session_id);
+}
+
+export function deleteRolloutRows(db: Db, rolloutId: string): void {
+  const rollout = db
+    .prepare("SELECT session_id FROM rollouts WHERE rollout_id = ?")
+    .get(rolloutId) as { session_id: string } | undefined;
+  if (!rollout) return;
+  db.prepare("DELETE FROM rollouts WHERE rollout_id = ?").run(rolloutId);
+  deleteSessionIfEmpty(db, rollout.session_id);
 }
 
 export function deleteSessionRows(db: Db, sessionId: string): void {
   db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
+}
+
+function deleteSessionIfEmpty(db: Db, sessionId: string): void {
+  const remaining = db
+    .prepare("SELECT 1 FROM rollouts WHERE session_id = ? LIMIT 1")
+    .get(sessionId);
+  if (!remaining) db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
 }

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { watch, FSWatcher } from "chokidar";
-import { Db, INDEX_SCHEMA_VERSION, deleteFileRows, deleteSessionRows } from "./db.js";
+import { Db, INDEX_SCHEMA_VERSION, deleteFileRows } from "./db.js";
 import { analyzeForkLineage, ForkLineageAnalysis } from "./lineage.js";
 import { RuntimePaths, toPortablePath } from "./paths.js";
 import {
@@ -11,13 +11,14 @@ import {
   parseSessionChunk,
   parseSessionFile
 } from "./parser.js";
-import { readSessionIndex } from "./session-index.js";
+import { filenameIdentity, rolloutIdentity } from "./rollout-identity.js";
+import { readSessionIndex, readThreadState, ThreadStateEntry } from "./session-index.js";
 import { ArchiveScope, IndexingStatus, SessionFile, SyncResult } from "./types.js";
 import { ensureDir, listJsonlFiles, nowIso } from "./util.js";
 
 interface IndexerScheduler {
-  setInterval(callback: () => void, delayMs: number): NodeJS.Timeout;
-  clearInterval(timer: NodeJS.Timeout): void;
+  setTimeout(callback: () => void, delayMs: number): NodeJS.Timeout;
+  clearTimeout(timer: NodeJS.Timeout): void;
 }
 
 interface CodexSessionIndexerOptions {
@@ -28,6 +29,7 @@ interface CodexSessionIndexerOptions {
 }
 
 interface IndexedFileState {
+  rollout_id: string;
   session_id: string;
   size: number;
   mtime_ms: number;
@@ -44,11 +46,33 @@ interface IndexWriteResult {
   toolCalls: number;
 }
 
-const FILE_INDEX_VERSION = 3;
+interface RolloutHistoryInput {
+  baseRolloutId: string;
+  replayParentSequence: number | null;
+  localStartSequence: number;
+  sequenceOffset: number;
+  parentCutoffSequence: number;
+  baseEndByteOffset: number | null;
+  boundaryByteStart: number | null;
+  boundaryByteLength: number | null;
+  boundaryHash: string | null;
+  source: "history_base" | "legacy_fork";
+}
+
+interface IndexedRolloutChoice {
+  rollout_id: string;
+  session_id: string;
+  file_path: string;
+  archive_scope: "active" | "archived";
+  mtime_ms: number;
+  session_updated_at: string | null;
+}
+
+const FILE_INDEX_VERSION = 4;
 
 const systemScheduler: IndexerScheduler = {
-  setInterval: (callback, delayMs) => setInterval(callback, delayMs),
-  clearInterval: (timer) => clearInterval(timer)
+  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimeout: (timer) => clearTimeout(timer)
 };
 
 export class CodexSessionIndexer {
@@ -82,16 +106,15 @@ export class CodexSessionIndexer {
     if (this.started) return;
     this.started = true;
     this.startWatcher();
-    void this.sync({ force: false }).catch(() => undefined);
-    this.pollTimer = this.scheduler.setInterval(() => {
-      void this.sync({ force: false }).catch(() => undefined);
-    }, this.pollIntervalMs);
+    void this.sync({ force: false })
+      .catch(() => undefined)
+      .finally(() => this.schedulePoll());
   }
 
   async stop(): Promise<void> {
     if (!this.started) return;
     this.started = false;
-    if (this.pollTimer) this.scheduler.clearInterval(this.pollTimer);
+    if (this.pollTimer) this.scheduler.clearTimeout(this.pollTimer);
     this.pollTimer = undefined;
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     this.debounceTimer = undefined;
@@ -161,6 +184,16 @@ export class CodexSessionIndexer {
     void this.sync({ force: false }).catch(() => undefined);
   }
 
+  private schedulePoll(): void {
+    if (!this.started || this.pollTimer) return;
+    this.pollTimer = this.scheduler.setTimeout(() => {
+      this.pollTimer = undefined;
+      void this.sync({ force: false })
+        .catch(() => undefined)
+        .finally(() => this.schedulePoll());
+    }, this.pollIntervalMs);
+  }
+
   private startWatcher(): void {
     ensureDir(this.paths.indexDir);
     const roots = [this.paths.sessionsDir, this.paths.archivedSessionsDir].filter((root) => fs.existsSync(root));
@@ -184,8 +217,8 @@ export class CodexSessionIndexer {
 
   private runSync(options: { rebuild?: boolean; force?: boolean }): SyncResult {
     const started = nowIso();
-    const upgradeRebuild = (this.db.pragma("user_version", { simple: true }) as number) < INDEX_SCHEMA_VERSION;
-    const rebuild = Boolean(options.rebuild || upgradeRebuild);
+    const schemaVersion = this.db.pragma("user_version", { simple: true }) as number;
+    const rebuild = Boolean(options.rebuild || schemaVersion < INDEX_SCHEMA_VERSION);
     const result: SyncResult = {
       started_at: started,
       completed_at: started,
@@ -206,7 +239,7 @@ export class CodexSessionIndexer {
       const discovered = this.discoverFiles();
       result.files_seen = discovered.length;
       const discoveredPaths = new Set(discovered.map((file) => file.filePath));
-      const indexedFiles = this.db.prepare("SELECT file_path FROM session_files").all() as { file_path: string }[];
+      const indexedFiles = this.db.prepare("SELECT file_path FROM rollouts").all() as { file_path: string }[];
       for (const indexed of indexedFiles) {
         if (!discoveredPaths.has(indexed.file_path)) {
           deleteFileRows(this.db, indexed.file_path);
@@ -215,16 +248,23 @@ export class CodexSessionIndexer {
       }
 
       const indexEntries = readSessionIndex(this.paths.codexHome);
-      const discoveredBySessionId = new Map<string, SessionFile>();
+      const threadState = readThreadState(this.paths.codexHome);
+      const discoveredBySessionId = new Map<string, SessionFile[]>();
+      const discoveredByRolloutId = new Map<string, SessionFile>();
       for (const file of discovered) {
-        const id = sessionIdFromFileName(file.filePath);
-        if (id) discoveredBySessionId.set(id, file);
+        const identity = filenameIdentity(file.filePath);
+        if (!identity) continue;
+        discoveredByRolloutId.set(identity.rolloutId, file);
+        const files = discoveredBySessionId.get(identity.sessionId) ?? [];
+        files.push(file);
+        discoveredBySessionId.set(identity.sessionId, files);
       }
       for (const file of discovered) {
         const known = this.db
           .prepare(
-            `SELECT session_id, size, mtime_ms, line_count, indexed_bytes, boundary_hash, current_turn_id, index_version
-             FROM session_files
+            `SELECT rollout_id, session_id, size, mtime_ms, line_count, indexed_bytes,
+                    boundary_hash, current_turn_id, index_version
+             FROM rollouts
              WHERE file_path = ?`
           )
           .get(file.filePath) as IndexedFileState | undefined;
@@ -247,12 +287,13 @@ export class CodexSessionIndexer {
           boundaryHash(file.filePath, known.indexed_bytes) === known.boundary_hash;
         const written = canAppend
           ? this.appendFile(file, known)
-          : this.reindexFile(file, indexEntries, discoveredBySessionId);
+          : this.reindexFile(file, indexEntries, discoveredBySessionId, discoveredByRolloutId);
         result.files_indexed += 1;
         result.events_indexed += written.events;
         result.messages_indexed += written.messages;
         result.tool_calls_indexed += written.toolCalls;
       }
+      this.refreshCurrentRollouts(threadState);
 
       if (rebuild) {
         this.db.exec("VACUUM;");
@@ -265,7 +306,7 @@ export class CodexSessionIndexer {
           throw new Error("rebuilt index could not be compacted because another database connection is active");
         }
       }
-      if (upgradeRebuild) {
+      if (schemaVersion < INDEX_SCHEMA_VERSION) {
         this.db.pragma(`user_version = ${INDEX_SCHEMA_VERSION}`);
       }
       return result;
@@ -278,35 +319,50 @@ export class CodexSessionIndexer {
   private reindexFile(
     file: SessionFile,
     indexEntries: ReturnType<typeof readSessionIndex>,
-    discoveredBySessionId: Map<string, SessionFile>
+    discoveredBySessionId: Map<string, SessionFile[]>,
+    discoveredByRolloutId: Map<string, SessionFile>
   ): IndexWriteResult {
     const parsed = parseSessionFile(file.filePath, file.size);
-    const sessionId = parsed.meta.id;
+    const identity = rolloutIdentity(file.filePath, parsed.meta);
+    const { sessionId, rolloutId } = identity;
     const indexEntry = indexEntries.get(sessionId);
     const updatedAt = indexEntry?.updated_at
       ? new Date(indexEntry.updated_at).toISOString()
       : new Date(file.mtimeMs).toISOString();
-    const lineage = this.analyzeLineage(parsed, discoveredBySessionId);
+    const lineage = parsed.meta.history_base
+      ? undefined
+      : this.analyzeLineage(parsed, discoveredBySessionId);
     const local = localChunk(parsed, lineage?.localStartSequence);
+    const history = parsed.meta.history_base
+      ? this.explicitHistory(parsed, rolloutId, discoveredByRolloutId)
+      : lineage
+        ? legacyHistory(lineage)
+        : undefined;
+    const firstSequence = local.rawEvents[0]?.sequence ?? parsed.rawEvents[0]?.sequence ?? 0;
 
     const transaction = this.db.transaction(() => {
-      const existing = this.db.prepare("SELECT file_path FROM sessions WHERE session_id = ?").get(sessionId) as
-        | { file_path: string }
-        | undefined;
-      if (existing && existing.file_path !== file.filePath) {
-        deleteSessionRows(this.db, sessionId);
-      } else {
-        deleteFileRows(this.db, file.filePath);
-      }
+      this.db.prepare("DELETE FROM rollouts WHERE rollout_id = ? OR file_path = ?").run(rolloutId, file.filePath);
 
       this.db
         .prepare(
-          `INSERT INTO sessions (session_id, file_path, archive_scope, forked_from_id, created_at, updated_at, thread_name, cwd, meta_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO sessions
+           (session_id, current_rollout_id, archive_scope, forked_from_id, created_at, updated_at,
+            thread_name, cwd, meta_json)
+           VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(session_id) DO UPDATE SET
+             archive_scope = excluded.archive_scope,
+             forked_from_id = COALESCE(sessions.forked_from_id, excluded.forked_from_id),
+             created_at = COALESCE(sessions.created_at, excluded.created_at),
+             updated_at = CASE
+               WHEN sessions.updated_at IS NULL OR excluded.updated_at > sessions.updated_at THEN excluded.updated_at
+               ELSE sessions.updated_at
+             END,
+             thread_name = COALESCE(excluded.thread_name, sessions.thread_name),
+             cwd = COALESCE(excluded.cwd, sessions.cwd),
+             meta_json = excluded.meta_json`
         )
         .run(
           sessionId,
-          file.filePath,
           file.archiveScope,
           parsed.meta.forked_from_id ?? null,
           parsed.meta.timestamp ? new Date(parsed.meta.timestamp).toISOString() : null,
@@ -316,41 +372,21 @@ export class CodexSessionIndexer {
           JSON.stringify(parsed.meta)
         );
 
-      this.insertParsedRows(sessionId, file, local);
-      if (lineage) {
-        this.db
-          .prepare(
-            `INSERT INTO session_lineage
-             (session_id, parent_session_id, replay_parent_sequence, local_start_sequence, sequence_offset,
-              parent_cutoff_sequence, boundary_message_sequence, boundary_byte_start, boundary_byte_length,
-              boundary_hash, indexed_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-          )
-          .run(
-            sessionId,
-            lineage.parentSessionId,
-            lineage.replayParentSequence,
-            lineage.localStartSequence,
-            lineage.sequenceOffset,
-            lineage.parentCutoffSequence,
-            lineage.boundaryMessageSequence,
-            lineage.boundaryByteStart,
-            lineage.boundaryByteLength,
-            lineage.boundaryHash,
-            nowIso()
-          );
-      }
       this.db
         .prepare(
-          `INSERT INTO session_files
-           (file_path, session_id, archive_scope, size, mtime_ms, line_count, indexed_bytes,
-            boundary_hash, current_turn_id, index_version, indexed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO rollouts
+           (rollout_id, session_id, file_path, archive_scope, history_mode, first_sequence,
+            size, mtime_ms, line_count, indexed_bytes, boundary_hash, current_turn_id,
+            index_version, indexed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
-          file.filePath,
+          rolloutId,
           sessionId,
+          file.filePath,
           file.archiveScope,
+          parsed.meta.history_mode,
+          firstSequence,
           file.size,
           file.mtimeMs,
           parsed.lineCount,
@@ -360,6 +396,31 @@ export class CodexSessionIndexer {
           FILE_INDEX_VERSION,
           nowIso()
         );
+
+      this.insertParsedRows(sessionId, rolloutId, file, local);
+      if (history) {
+        this.db
+          .prepare(
+            `INSERT INTO rollout_history
+             (rollout_id, base_rollout_id, replay_parent_sequence, local_start_sequence,
+              sequence_offset, parent_cutoff_sequence, base_end_byte_offset,
+              boundary_byte_start, boundary_byte_length, boundary_hash, source)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            rolloutId,
+            history.baseRolloutId,
+            history.replayParentSequence,
+            history.localStartSequence,
+            history.sequenceOffset,
+            history.parentCutoffSequence,
+            history.baseEndByteOffset,
+            history.boundaryByteStart,
+            history.boundaryByteLength,
+            history.boundaryHash,
+            history.source
+          );
+      }
     });
     transaction();
     return {
@@ -377,7 +438,7 @@ export class CodexSessionIndexer {
       currentTurnId: known.current_turn_id
     });
     const transaction = this.db.transaction(() => {
-      this.insertParsedRows(known.session_id, file, parsed);
+      this.insertParsedRows(known.session_id, known.rollout_id, file, parsed);
       this.db
         .prepare(
           `UPDATE sessions
@@ -387,7 +448,7 @@ export class CodexSessionIndexer {
         .run(file.archiveScope, new Date(file.mtimeMs).toISOString(), known.session_id);
       this.db
         .prepare(
-          `UPDATE session_files
+          `UPDATE rollouts
            SET archive_scope = ?, size = ?, mtime_ms = ?, line_count = ?, indexed_bytes = ?,
                boundary_hash = ?, current_turn_id = ?, index_version = ?, indexed_at = ?
            WHERE file_path = ?`
@@ -415,54 +476,139 @@ export class CodexSessionIndexer {
 
   private analyzeLineage(
     parsed: ParsedSessionFile,
-    discoveredBySessionId: Map<string, SessionFile>
+    discoveredBySessionId: Map<string, SessionFile[]>
   ): ForkLineageAnalysis | undefined {
-    const parentId = parsed.meta.forked_from_id;
+    const parentId = parsed.meta.forked_from_id?.toLowerCase();
     if (!parentId) return undefined;
     const indexedParent = this.db
-      .prepare("SELECT file_path, archive_scope FROM sessions WHERE session_id = ?")
+      .prepare(
+        `SELECT r.file_path, r.archive_scope
+         FROM sessions s
+         JOIN rollouts r ON r.rollout_id = s.current_rollout_id
+         WHERE s.session_id = ?`
+      )
       .get(parentId) as { file_path: string; archive_scope: "active" | "archived" } | undefined;
-    const parentFile = discoveredBySessionId.get(parentId) ?? (
-      indexedParent && fs.existsSync(indexedParent.file_path)
-        ? this.fileInfo(indexedParent.file_path, indexedParent.archive_scope)
-        : undefined
-    );
-    if (!parentFile) return undefined;
-    const parent = parseSessionFile(parentFile.filePath, parentFile.size);
-    return analyzeForkLineage(parsed, parent);
+    const candidates = discoveredBySessionId.get(parentId) ?? [];
+    if (candidates.length === 0 && indexedParent && fs.existsSync(indexedParent.file_path)) {
+      candidates.push(this.fileInfo(indexedParent.file_path, indexedParent.archive_scope));
+    }
+    let best: ForkLineageAnalysis | undefined;
+    for (const parentFile of candidates) {
+      const parent = parseSessionFile(parentFile.filePath, parentFile.size);
+      const parentIdentity = rolloutIdentity(parentFile.filePath, parent.meta);
+      const analyzed = analyzeForkLineage(parsed, parent, parentIdentity.rolloutId);
+      if (!analyzed) continue;
+      if (!best || analyzed.replayParentSequence > best.replayParentSequence) best = analyzed;
+    }
+    return best;
   }
 
-  private insertParsedRows(sessionId: string, file: SessionFile, parsed: ParsedSessionChunk): void {
+  private explicitHistory(
+    parsed: ParsedSessionFile,
+    rolloutId: string,
+    discoveredByRolloutId: Map<string, SessionFile>
+  ): RolloutHistoryInput {
+    const history = parsed.meta.history_base;
+    if (!history) throw new Error(`rollout ${rolloutId} has no explicit history base`);
+    const baseRolloutId = history.thread_id.toLowerCase();
+    const discoveredBase = discoveredByRolloutId.get(baseRolloutId);
+    const indexedBase = this.db
+      .prepare("SELECT file_path FROM rollouts WHERE rollout_id = ?")
+      .get(baseRolloutId) as { file_path: string } | undefined;
+    const basePath = discoveredBase?.filePath ?? indexedBase?.file_path;
+    const boundary = basePath
+      ? boundaryWindow(basePath, history.end_byte_offset)
+      : undefined;
+    return {
+      baseRolloutId,
+      replayParentSequence: null,
+      localStartSequence: history.end_ordinal_exclusive,
+      sequenceOffset: 0,
+      parentCutoffSequence: history.end_ordinal_exclusive - 1,
+      baseEndByteOffset: history.end_byte_offset,
+      boundaryByteStart: boundary?.start ?? null,
+      boundaryByteLength: boundary?.length ?? null,
+      boundaryHash: boundary?.hash ?? null,
+      source: "history_base"
+    };
+  }
+
+  private refreshCurrentRollouts(threadState: Map<string, ThreadStateEntry>): void {
+    const rows = this.db
+      .prepare(
+        `SELECT r.rollout_id, r.session_id, r.file_path, r.archive_scope, r.mtime_ms,
+                s.updated_at AS session_updated_at
+         FROM rollouts r
+         JOIN sessions s ON s.session_id = r.session_id`
+      )
+      .all() as IndexedRolloutChoice[];
+    const grouped = new Map<string, IndexedRolloutChoice[]>();
+    for (const row of rows) {
+      const choices = grouped.get(row.session_id) ?? [];
+      choices.push(row);
+      grouped.set(row.session_id, choices);
+    }
+
+    const update = this.db.prepare(
+      `UPDATE sessions
+       SET current_rollout_id = ?, archive_scope = ?, updated_at = ?
+       WHERE session_id = ?`
+    );
+    const transaction = this.db.transaction(() => {
+      for (const [sessionId, choices] of grouped) {
+        const state = threadState.get(sessionId);
+        const selectedByState = state
+          ? choices.find((choice) => pathKey(choice.file_path) === pathKey(state.rolloutPath))
+          : undefined;
+        const selected = selectedByState ?? [...choices].sort((left, right) =>
+          right.mtime_ms - left.mtime_ms || right.file_path.localeCompare(left.file_path)
+        )[0];
+        const updatedAt = state
+          ? new Date(state.updatedAt * 1_000).toISOString()
+          : selected.session_updated_at ?? new Date(selected.mtime_ms).toISOString();
+        update.run(selected.rollout_id, selected.archive_scope, updatedAt, sessionId);
+      }
+    });
+    transaction();
+  }
+
+  private insertParsedRows(
+    sessionId: string,
+    rolloutId: string,
+    file: SessionFile,
+    parsed: ParsedSessionChunk
+  ): void {
     const rawIdByLine = new Map<number, number>();
     const turnRefById = new Map<string, number>();
     const rawInsert = this.db.prepare(
       `INSERT INTO raw_events
-       (session_id, file_path, line_no, sequence, timestamp, event_type, payload_type, role,
+       (session_id, rollout_id, line_no, sequence, timestamp, event_type, payload_type, role,
         byte_start, byte_length, raw_json)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const locatorInsert = this.db.prepare(
       `INSERT OR IGNORE INTO session_locator_tokens
-       (token, session_id, archive_scope, sequence, timestamp, call_id, tool_name, source, raw_event_id, indexed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (token, session_id, rollout_id, archive_scope, sequence, timestamp, call_id, tool_name,
+        source, raw_event_id, indexed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const taskInputInsert = this.db.prepare(
       `INSERT OR IGNORE INTO session_task_inputs
-       (session_id, sequence, timestamp, call_id, tool_name, token, task_text, turn_ref, raw_event_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (session_id, rollout_id, sequence, timestamp, call_id, tool_name, token, task_text, turn_ref, raw_event_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const turnInsert = this.db.prepare(
       `INSERT OR IGNORE INTO session_turns
-       (session_id, turn_id, start_sequence, end_sequence, rewound)
-       VALUES (?, ?, ?, NULL, 0)`
+       (session_id, rollout_id, turn_id, start_sequence, end_sequence, rewound)
+       VALUES (?, ?, ?, ?, NULL, 0)`
     );
     const turnSelect = this.db.prepare(
-      "SELECT id FROM session_turns WHERE session_id = ? AND turn_id = ?"
+      "SELECT id FROM session_turns WHERE rollout_id = ? AND turn_id = ?"
     );
     const turnClose = this.db.prepare(
       `UPDATE session_turns
        SET end_sequence = ?
-       WHERE session_id = ? AND turn_id = ? AND end_sequence IS NULL`
+       WHERE rollout_id = ? AND turn_id = ? AND end_sequence IS NULL`
     );
     const rewindLastEndedTurn = this.db.prepare(
       `UPDATE session_turns
@@ -470,7 +616,7 @@ export class CodexSessionIndexer {
        WHERE id = (
          SELECT id
          FROM session_turns
-         WHERE session_id = ? AND end_sequence IS NOT NULL
+         WHERE rollout_id = ? AND end_sequence IS NOT NULL
          ORDER BY end_sequence DESC
          LIMIT 1
        ) AND rewound = 0`
@@ -479,7 +625,7 @@ export class CodexSessionIndexer {
       if (!turnId) return null;
       const cached = turnRefById.get(turnId);
       if (cached !== undefined) return cached;
-      const row = turnSelect.get(sessionId, turnId) as { id: number } | undefined;
+      const row = turnSelect.get(rolloutId, turnId) as { id: number } | undefined;
       if (!row) return null;
       turnRefById.set(turnId, row.id);
       return row.id;
@@ -487,7 +633,7 @@ export class CodexSessionIndexer {
     for (const raw of parsed.rawEvents) {
       const info = rawInsert.run(
         sessionId,
-        file.filePath,
+        rolloutId,
         raw.lineNo,
         raw.sequence,
         raw.timestamp,
@@ -501,21 +647,22 @@ export class CodexSessionIndexer {
       const rawEventId = Number(info.lastInsertRowid);
       rawIdByLine.set(raw.lineNo, rawEventId);
       if (raw.eventType === "event_msg" && raw.payloadType === "task_started" && raw.turnId) {
-        turnInsert.run(sessionId, raw.turnId, raw.sequence);
+        turnInsert.run(sessionId, rolloutId, raw.turnId, raw.sequence);
         turnRef(raw.turnId);
       } else if (
         raw.eventType === "event_msg" &&
         (raw.payloadType === "task_complete" || raw.payloadType === "turn_aborted") &&
         raw.turnId
       ) {
-        turnClose.run(raw.sequence, sessionId, raw.turnId);
+        turnClose.run(raw.sequence, rolloutId, raw.turnId);
       } else if (raw.eventType === "event_msg" && raw.payloadType === "thread_rolled_back") {
-        rewindLastEndedTurn.run(sessionId);
+        rewindLastEndedTurn.run(rolloutId);
       }
-      for (const locator of locatorTokensFromMcpToolCallEnd(raw)) {
+      for (const locator of locatorTokensFromCompletedMcpCall(raw)) {
         locatorInsert.run(
           locator.token,
           sessionId,
+          rolloutId,
           file.archiveScope,
           locator.sequence,
           locator.timestamp,
@@ -526,10 +673,11 @@ export class CodexSessionIndexer {
           nowIso()
         );
       }
-      const taskInput = taskInputFromMcpToolCallEnd(raw);
+      const taskInput = taskInputFromCompletedMcpCall(raw);
       if (taskInput) {
         taskInputInsert.run(
           sessionId,
+          rolloutId,
           taskInput.sequence,
           taskInput.timestamp,
           taskInput.callId,
@@ -543,7 +691,8 @@ export class CodexSessionIndexer {
     }
 
     const messageInsert = this.db.prepare(
-      `INSERT INTO messages (session_id, sequence, timestamp, role, content_text, content_json, turn_ref, raw_event_id)
+      `INSERT INTO messages
+       (session_id, rollout_id, sequence, timestamp, role, content_text, turn_ref, raw_event_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     );
     for (const message of parsed.messages) {
@@ -551,11 +700,11 @@ export class CodexSessionIndexer {
       if (rawEventId === undefined) continue;
       messageInsert.run(
         sessionId,
+        rolloutId,
         message.sequence,
         message.timestamp,
         message.role,
         message.contentText,
-        message.contentJson,
         turnRef(message.turnId),
         rawEventId
       );
@@ -564,9 +713,9 @@ export class CodexSessionIndexer {
     const outputByCallId = new Map(parsed.toolOutputs.map((output) => [output.callId, output]));
     const toolInsert = this.db.prepare(
       `INSERT INTO tool_calls
-       (session_id, sequence, timestamp, call_id, tool_name, arguments_json, output_sequence,
+       (session_id, rollout_id, sequence, timestamp, call_id, tool_name, arguments_json, output_sequence,
         output_timestamp, output_text, output_json, turn_ref, call_raw_event_id, output_raw_event_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     for (const call of parsed.toolCalls) {
       const callRawEventId = rawIdByLine.get(call.rawLineNo);
@@ -574,6 +723,7 @@ export class CodexSessionIndexer {
       const output = outputByCallId.get(call.callId);
       toolInsert.run(
         sessionId,
+        rolloutId,
         call.sequence,
         call.timestamp,
         call.callId,
@@ -595,6 +745,7 @@ export class CodexSessionIndexer {
         locatorInsert.run(
           locator.token,
           sessionId,
+          rolloutId,
           file.archiveScope,
           locator.sequence,
           locator.timestamp,
@@ -610,7 +761,7 @@ export class CodexSessionIndexer {
     const updateOutput = this.db.prepare(
       `UPDATE tool_calls
        SET output_sequence = ?, output_timestamp = ?, output_text = ?, output_json = ?, output_raw_event_id = ?
-       WHERE session_id = ? AND call_id = ?`
+       WHERE rollout_id = ? AND call_id = ?`
     );
     for (const output of parsed.toolOutputs) {
       if (parsed.toolCalls.some((call) => call.callId === output.callId)) continue;
@@ -622,7 +773,7 @@ export class CodexSessionIndexer {
         output.outputText,
         output.outputJson,
         outputRawEventId,
-        sessionId,
+        rolloutId,
         output.callId
       );
     }
@@ -722,8 +873,53 @@ function boundaryHash(filePath: string, indexedBytes: number): string {
   }
 }
 
-function sessionIdFromFileName(filePath: string): string | undefined {
-  return /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i.exec(path.basename(filePath))?.[1];
+function boundaryWindow(filePath: string, endByteOffset: number): { start: number; length: number; hash: string } | undefined {
+  if (endByteOffset === 0) return undefined;
+  const size = fs.statSync(filePath).size;
+  if (endByteOffset > size) {
+    throw new Error(`history base byte offset ${endByteOffset} exceeds rollout size ${size}: ${filePath}`);
+  }
+  const length = Math.min(4_096, endByteOffset);
+  const start = endByteOffset - length;
+  const buffer = Buffer.allocUnsafe(length);
+  const handle = fs.openSync(filePath, "r");
+  let read = 0;
+  try {
+    while (read < length) {
+      const count = fs.readSync(handle, buffer, read, length - read, start + read);
+      if (count === 0) break;
+      read += count;
+    }
+  } finally {
+    fs.closeSync(handle);
+  }
+  if (read !== length) throw new Error(`could not read history base boundary: ${filePath}`);
+  return {
+    start,
+    length,
+    hash: crypto.createHash("sha256").update(buffer).digest("hex")
+  };
+}
+
+function legacyHistory(lineage: ForkLineageAnalysis): RolloutHistoryInput {
+  return {
+    baseRolloutId: lineage.parentRolloutId,
+    replayParentSequence: lineage.replayParentSequence,
+    localStartSequence: lineage.localStartSequence,
+    sequenceOffset: lineage.sequenceOffset,
+    parentCutoffSequence: lineage.parentCutoffSequence,
+    baseEndByteOffset: null,
+    boundaryByteStart: lineage.boundaryByteStart,
+    boundaryByteLength: lineage.boundaryByteLength,
+    boundaryHash: lineage.boundaryHash,
+    source: "legacy_fork"
+  };
+}
+
+function pathKey(filePath: string): string {
+  const withoutExtendedPrefix = filePath.startsWith("\\\\?\\") ? filePath.slice(4) : filePath;
+  const resolved = path.resolve(withoutExtendedPrefix);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
 interface LocatorTokenOccurrence {
@@ -750,7 +946,7 @@ interface RawTaskInputOccurrence {
   task: string;
 }
 
-interface McpToolCallEnd {
+interface CompletedMcpToolCall {
   sequence: number;
   timestamp: string | null;
   callId: string | null;
@@ -763,14 +959,14 @@ interface McpToolCallEnd {
 const LOCATOR_TOKEN_MARKER = "codex-session-locator:";
 const UUID_PATTERN = /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi;
 
-function locatorTokensFromMcpToolCallEnd(raw: {
+function locatorTokensFromCompletedMcpCall(raw: {
   sequence: number;
   timestamp: string | null;
   eventType: string;
   payloadType: string | null;
   payload: Record<string, unknown>;
 }): RawLocatorTokenOccurrence[] {
-  const call = parseMcpToolCallEnd(raw);
+  const call = parseCompletedMcpToolCall(raw);
   if (!call || !isCodexSessionServer(call.serverName) || !isGetSessionTokenTool(call.toolName)) return [];
 
   const resultJson = JSON.stringify(call.okResult);
@@ -783,14 +979,14 @@ function locatorTokensFromMcpToolCallEnd(raw: {
   }));
 }
 
-function taskInputFromMcpToolCallEnd(raw: {
+function taskInputFromCompletedMcpCall(raw: {
   sequence: number;
   timestamp: string | null;
   eventType: string;
   payloadType: string | null;
   payload: Record<string, unknown>;
 }): RawTaskInputOccurrence | undefined {
-  const call = parseMcpToolCallEnd(raw);
+  const call = parseCompletedMcpToolCall(raw);
   if (!call || !isCodexSessionServer(call.serverName) || !isGetTaskTool(call.toolName)) return undefined;
 
   const invocationToken = stringValue(call.arguments.token)?.trim().toLowerCase();
@@ -808,28 +1004,45 @@ function taskInputFromMcpToolCallEnd(raw: {
   };
 }
 
-function parseMcpToolCallEnd(raw: {
+function parseCompletedMcpToolCall(raw: {
   sequence: number;
   timestamp: string | null;
   eventType: string;
   payloadType: string | null;
   payload: Record<string, unknown>;
-}): McpToolCallEnd | undefined {
-  if (raw.eventType !== "event_msg" || raw.payloadType !== "mcp_tool_call_end") return undefined;
-  const invocation = recordValue(raw.payload.invocation);
-  const serverName = stringValue(invocation.server);
-  const toolName = stringValue(invocation.tool);
+}): CompletedMcpToolCall | undefined {
+  if (raw.eventType !== "event_msg") return undefined;
+  if (raw.payloadType === "mcp_tool_call_end") {
+    const invocation = recordValue(raw.payload.invocation);
+    const serverName = stringValue(invocation.server);
+    const toolName = stringValue(invocation.tool);
+    if (!serverName || !toolName) return undefined;
+    const result = recordValue(raw.payload.result);
+    if (!("Ok" in result)) return undefined;
+    return {
+      sequence: raw.sequence,
+      timestamp: raw.timestamp,
+      callId: stringValue(raw.payload.call_id) ?? null,
+      serverName,
+      toolName,
+      arguments: recordValue(invocation.arguments),
+      okResult: result.Ok
+    };
+  }
+  if (raw.payloadType !== "item_completed") return undefined;
+  const item = recordValue(raw.payload.item);
+  if (item.type !== "McpToolCall" || item.status !== "completed") return undefined;
+  const serverName = stringValue(item.server);
+  const toolName = stringValue(item.tool);
   if (!serverName || !toolName) return undefined;
-  const result = recordValue(raw.payload.result);
-  if (!("Ok" in result)) return undefined;
   return {
     sequence: raw.sequence,
     timestamp: raw.timestamp,
-    callId: stringValue(raw.payload.call_id) ?? null,
+    callId: stringValue(item.id) ?? null,
     serverName,
     toolName,
-    arguments: recordValue(invocation.arguments),
-    okResult: result.Ok
+    arguments: recordValue(item.arguments),
+    okResult: recordValue(item.result)
   };
 }
 

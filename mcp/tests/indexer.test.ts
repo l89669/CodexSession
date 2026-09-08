@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
-import { openDatabase } from "../src/db.js";
+import { INDEX_SCHEMA_VERSION, openDatabase } from "../src/db.js";
 import { CodexSessionIndexer } from "../src/indexer.js";
 import { parseSessionFile } from "../src/parser.js";
 import { resolveRuntimePaths, RuntimePaths } from "../src/paths.js";
@@ -29,18 +29,20 @@ class CountingIndexer extends CodexSessionIndexer {
 class ManualScheduler {
   private readonly callbacks = new Map<NodeJS.Timeout, () => void>();
 
-  setInterval(callback: () => void): NodeJS.Timeout {
+  setTimeout(callback: () => void): NodeJS.Timeout {
     const handle = {} as NodeJS.Timeout;
     this.callbacks.set(handle, callback);
     return handle;
   }
 
-  clearInterval(handle: NodeJS.Timeout): void {
+  clearTimeout(handle: NodeJS.Timeout): void {
     this.callbacks.delete(handle);
   }
 
   runAll(): void {
-    for (const callback of [...this.callbacks.values()]) callback();
+    const callbacks = [...this.callbacks.values()];
+    this.callbacks.clear();
+    for (const callback of callbacks) callback();
   }
 }
 
@@ -108,15 +110,181 @@ test("token lookup incrementally indexes a newly written locator marker", async 
   );
 });
 
+test("item_completed MCP calls populate recovery indexes across a schema rebuild", async (t) => {
+  const env = createFixtureHome(t);
+  const sessionId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+  const locatorToken = "11111111-2222-4333-8444-555555555555";
+  const taskToken = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const filePath = path.join(env.activeDir, `rollout-${sessionId}.jsonl`);
+  writeLines(filePath, [
+    sessionMetaLine(sessionId, undefined, "2026-06-07T00:00:00.000Z"),
+    eventLine("task_started", { turn_id: "new-format-turn" }),
+    completedMcpCallLine(
+      "new-format-token-call",
+      "codex_session_get_session_token",
+      {},
+      { status: "ok", data: { token: locatorToken, marker: `codex-session-locator:${locatorToken}` } }
+    ),
+    completedMcpCallLine(
+      "new-format-task-call",
+      "codex_session_get_task",
+      { token: taskToken },
+      { status: "ok", data: { token: taskToken, task: "task recovered from new event format" } }
+    ),
+    eventLine("task_complete", { turn_id: "new-format-turn" })
+  ]);
+
+  const { db, queries, indexer } = openFixture(env);
+  await indexer.sync({ rebuild: true, force: true });
+
+  const located = await queries.getSessionByToken({ token: locatorToken });
+  assert.equal((located.data as any).session_id, sessionId);
+  const recent = await queries.recentUserInputs({ session_id: sessionId, limit: 10 });
+  assert.equal((recent.data as any).inputs[0].task, "task recovered from new event format");
+  assert.deepEqual(
+    db.prepare("SELECT COUNT(*) AS locators FROM session_locator_tokens").get(),
+    { locators: 1 }
+  );
+  assert.deepEqual(
+    db.prepare("SELECT COUNT(*) AS task_inputs, COUNT(turn_ref) AS turn_refs FROM session_task_inputs").get(),
+    { task_inputs: 1, turn_refs: 1 }
+  );
+
+  db.exec("DELETE FROM session_locator_tokens; DELETE FROM session_task_inputs;");
+  db.pragma("user_version = 7");
+  await indexer.sync();
+
+  assert.deepEqual(
+    db.prepare("SELECT COUNT(*) AS locators FROM session_locator_tokens").get(),
+    { locators: 1 }
+  );
+  assert.deepEqual(
+    db.prepare("SELECT COUNT(*) AS task_inputs, COUNT(turn_ref) AS turn_refs FROM session_task_inputs").get(),
+    { task_inputs: 1, turn_refs: 1 }
+  );
+  assert.equal(db.pragma("user_version", { simple: true }), INDEX_SCHEMA_VERSION);
+});
+
+test("locator lookup chooses the original token-generating call over inherited copies", async (t) => {
+  const env = createFixtureHome(t);
+  const originalSession = "11111111-aaaa-4111-8111-111111111111";
+  const copiedSession = "22222222-bbbb-4222-8222-222222222222";
+  const token = "33333333-cccc-4333-8333-333333333333";
+  const callId = "shared-token-call";
+  const originalCall = completedMcpCallLine(
+    callId,
+    "codex_session_get_session_token",
+    {},
+    { status: "ok", data: { token, marker: `codex-session-locator:${token}` } }
+  );
+  const copiedCall = structuredClone(originalCall);
+  originalCall.timestamp = "2026-06-07T00:00:01.000Z";
+  copiedCall.timestamp = "2026-06-07T01:00:01.000Z";
+  writeLines(path.join(env.activeDir, "original.jsonl"), [
+    sessionMetaLine(originalSession, undefined, "2026-06-07T00:00:00.000Z"),
+    originalCall
+  ]);
+  writeLines(path.join(env.activeDir, "copy.jsonl"), [
+    sessionMetaLine(copiedSession, undefined, "2026-06-07T01:00:00.000Z"),
+    copiedCall
+  ]);
+
+  const { queries, indexer } = openFixture(env);
+  await indexer.sync({ rebuild: true, force: true });
+  const located = await queries.getSessionByToken({ token });
+  assert.equal(located.status, "ok");
+  assert.equal((located.data as any).session_id, originalSession);
+  assert.equal((located.data as any).occurrences.length, 1);
+});
+
+test("paginated rollout history follows immutable history_base cutoffs", async (t) => {
+  const env = createFixtureHome(t);
+  const threadId = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+  const middleRolloutId = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+  const currentRolloutId = "cccccccc-3333-4333-8333-cccccccccccc";
+  const token = "dddddddd-4444-4444-8444-dddddddddddd";
+  const rootFile = path.join(env.activeDir, `rollout-2026-06-07T00-00-00-${threadId}.jsonl`);
+  const middleFile = path.join(
+    env.activeDir,
+    `rollout-2026-06-07T00-01-00-${threadId}_${middleRolloutId}.jsonl`
+  );
+  const currentFile = path.join(
+    env.activeDir,
+    `rollout-2026-06-07T00-02-00-${threadId}_${currentRolloutId}.jsonl`
+  );
+
+  const rootLines = [
+    paginatedMetaLine(threadId, 0),
+    { ...messageLine("user", "root retained"), ordinal: 1 },
+    { ...messageLine("user", "root replaced"), ordinal: 2 }
+  ];
+  writeLines(rootFile, rootLines);
+  const middleLines = [
+    paginatedMetaLine(threadId, 2, {
+      thread_id: threadId,
+      end_ordinal_exclusive: 2,
+      end_byte_offset: serializedPrefixBytes(rootLines, 2)
+    }),
+    { ...messageLine("user", "middle retained"), ordinal: 3 },
+    { ...messageLine("user", "middle replaced"), ordinal: 4 }
+  ];
+  writeLines(middleFile, middleLines);
+  const currentLines = [
+    paginatedMetaLine(threadId, 4, {
+      thread_id: middleRolloutId,
+      end_ordinal_exclusive: 4,
+      end_byte_offset: serializedPrefixBytes(middleLines, 2)
+    }),
+    {
+      ...completedMcpCallLine(
+        "paginated-token-call",
+        "codex_session_get_session_token",
+        {},
+        { status: "ok", data: { token, marker: `codex-session-locator:${token}` } }
+      ),
+      ordinal: 5
+    },
+    { ...messageLine("user", "current input"), ordinal: 6 }
+  ];
+  writeLines(currentFile, currentLines);
+  fs.utimesSync(rootFile, new Date("2026-06-07T00:00:00Z"), new Date("2026-06-07T00:00:00Z"));
+  fs.utimesSync(middleFile, new Date("2026-06-07T00:01:00Z"), new Date("2026-06-07T00:01:00Z"));
+  fs.utimesSync(currentFile, new Date("2026-06-07T00:02:00Z"), new Date("2026-06-07T00:02:00Z"));
+
+  const { db, queries, indexer } = openFixture(env);
+  const rebuilt = await indexer.sync({ rebuild: true, force: true });
+  assert.equal(rebuilt.files_indexed, 3);
+  assert.deepEqual(
+    db.prepare("SELECT COUNT(*) AS sessions FROM sessions").get(),
+    { sessions: 1 }
+  );
+  assert.deepEqual(
+    db.prepare("SELECT COUNT(*) AS rollouts FROM rollouts").get(),
+    { rollouts: 3 }
+  );
+  assert.deepEqual(
+    db.prepare("SELECT COUNT(*) AS edges FROM rollout_history").get(),
+    { edges: 2 }
+  );
+
+  const recent = await queries.recentUserInputs({ session_id: threadId, limit: 10 });
+  assert.deepEqual(
+    (recent.data as any).inputs.map((input: any) => [input.sequence, input.content_text]),
+    [[6, "current input"], [3, "middle retained"], [1, "root retained"]]
+  );
+  const replaced = await queries.findByText({ text: "middle replaced" });
+  assert.equal(replaced.status, "not_found");
+  const located = await queries.getSessionByToken({ token });
+  assert.equal((located.data as any).session_id, threadId);
+  assert.equal((await indexer.sync()).files_indexed, 0);
+});
+
 test("a legacy index is rebuilt and physically compacted once", async (t) => {
   const env = createFixtureHome(t);
   writeMiniSession(path.join(env.activeDir, "legacy.jsonl"), "legacy-session", "legacy input");
   const { db, indexer } = openFixture(env);
   await indexer.sync({ force: true });
 
-  const firstRawEventId = (db
-    .prepare("SELECT MIN(id) AS id FROM raw_events")
-    .get() as { id: number }).id;
   db.exec(`
     CREATE TABLE upgrade_ballast (content BLOB);
     INSERT INTO upgrade_ballast VALUES (zeroblob(8388608));
@@ -125,14 +293,6 @@ test("a legacy index is rebuilt and physically compacted once", async (t) => {
   db.pragma("wal_checkpoint(TRUNCATE)");
   const legacyBytes = fs.statSync(env.dbPath).size;
   db.pragma("user_version = 5");
-  db.exec(`
-    UPDATE session_files
-    SET index_version = 1,
-        indexed_bytes = NULL,
-        boundary_hash = NULL,
-        current_turn_id = NULL;
-  `);
-  db.exec("DELETE FROM sessions;");
   const observer = openDatabase(env.dbPath);
   assert.equal(observer.pragma("user_version", { simple: true }), 5);
   observer.close();
@@ -142,15 +302,15 @@ test("a legacy index is rebuilt and physically compacted once", async (t) => {
   assert.deepEqual(
     {
       userVersion: db.pragma("user_version", { simple: true }),
-      indexVersion: (db.prepare("SELECT index_version FROM session_files").get() as { index_version: number }).index_version,
-      rawEventWasRebuilt: (db.prepare("SELECT MIN(id) AS id FROM raw_events").get() as { id: number }).id > firstRawEventId,
+      indexVersion: (db.prepare("SELECT index_version FROM rollouts").get() as { index_version: number }).index_version,
+      rawEventsRebuilt: (db.prepare("SELECT COUNT(*) AS count FROM raw_events").get() as { count: number }).count > 0,
       filesIndexed: upgraded.files_indexed,
       fileShrank: compactedBytes < legacyBytes
     },
     {
-      userVersion: 7,
-      indexVersion: 3,
-      rawEventWasRebuilt: true,
+      userVersion: INDEX_SCHEMA_VERSION,
+      indexVersion: 4,
+      rawEventsRebuilt: true,
       filesIndexed: 1,
       fileShrank: true
     }
@@ -186,18 +346,17 @@ test("fork history is shared at the rollback boundary and later file changes app
 
   const lineage = db
     .prepare(
-      `SELECT parent_session_id, replay_parent_sequence, local_start_sequence,
-              parent_cutoff_sequence, boundary_message_sequence
-       FROM session_lineage
-       WHERE session_id = ?`
+      `SELECT base_rollout_id, replay_parent_sequence, local_start_sequence,
+              parent_cutoff_sequence
+       FROM rollout_history
+       WHERE rollout_id = ?`
     )
     .get(childId);
   assert.deepEqual(lineage, {
-    parent_session_id: parentId,
+    base_rollout_id: parentId,
     replay_parent_sequence: parentLines.length,
     local_start_sequence: parentLines.length + 2,
-    parent_cutoff_sequence: 5,
-    boundary_message_sequence: 4
+    parent_cutoff_sequence: 5
   });
   assert.equal(
     (db.prepare("SELECT COUNT(*) AS count FROM raw_events WHERE session_id = ?").get(childId) as { count: number }).count,
@@ -364,6 +523,7 @@ test("periodic polling indexes appended JSONL bytes even when mtime does not cha
 
   indexer.start();
   assert.equal(await indexer.waitForIdle(1_000), true);
+  await Promise.resolve();
   const originalTimes = fs.statSync(filePath);
   appendLines(filePath, [messageLine("user", "appended without mtime")]);
   fs.utimesSync(filePath, originalTimes.atime, originalTimes.mtime);
@@ -508,6 +668,56 @@ function taskRetrievalLine(
       }
     }
   };
+}
+
+function completedMcpCallLine(
+  id: string,
+  tool: string,
+  args: Record<string, unknown>,
+  result: Record<string, unknown>
+): Record<string, unknown> {
+  return {
+    timestamp: "2026-06-07T01:00:00.003Z",
+    type: "event_msg",
+    payload: {
+      type: "item_completed",
+      turn_id: "new-format-turn",
+      item: {
+        type: "McpToolCall",
+        id,
+        server: "codex_session_context",
+        tool,
+        arguments: args,
+        status: "completed",
+        result: {
+          content: [{ type: "text", text: JSON.stringify(result) }]
+        }
+      }
+    }
+  };
+}
+
+function paginatedMetaLine(
+  threadId: string,
+  ordinal: number,
+  historyBase?: { thread_id: string; end_ordinal_exclusive: number; end_byte_offset: number }
+): Record<string, unknown> {
+  return {
+    timestamp: "2026-06-07T00:00:00.000Z",
+    ordinal,
+    type: "session_meta",
+    payload: {
+      session_id: threadId,
+      id: threadId,
+      timestamp: "2026-06-07T00:00:00.000Z",
+      history_mode: "paginated",
+      history_base: historyBase
+    }
+  };
+}
+
+function serializedPrefixBytes(lines: Record<string, unknown>[], count: number): number {
+  return Buffer.byteLength(`${lines.slice(0, count).map((line) => JSON.stringify(line)).join("\n")}\n`, "utf8");
 }
 
 function writeLines(filePath: string, lines: Record<string, unknown>[]): void {

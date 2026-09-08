@@ -41,10 +41,10 @@ class BackendDaemon {
     void this.handleRequest(request, response);
   });
   private readonly transports = new Set<HttpBridgeServerTransport>();
+  private resolveStopped!: () => void;
   private readonly stopped = new Promise<void>((resolve) => {
     this.resolveStopped = resolve;
   });
-  private resolveStopped!: () => void;
   private runtime: SessionRuntime | undefined;
   private idleTimer: NodeJS.Timeout | undefined;
   private shuttingDown = false;

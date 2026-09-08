@@ -25,6 +25,7 @@ Use the `codex_session_*` MCP tools as a local transcript and delegated-task dat
 6. After locating the right session, choose the narrowest useful query:
    - latest inputs: `codex_session_recent_user_inputs` with a small `limit`. Read `data.inputs` from newest to oldest:
      - `input_type: user_message` is an ordinary user message. Its text is in `content_text`.
+     - `input_type: cross_thread_message` is input delivered from another Codex task. Its exact `<codex_delegation>` envelope is in `content_text`.
      - `input_type: published_task_retrieval` is an agent input created when that session retrieves a task through `codex_session_get_task`. Its text is in `task`.
    - exact phrase or constraint: `codex_session_keyword_search`.
    - nearby transcript: `codex_session_messages`.

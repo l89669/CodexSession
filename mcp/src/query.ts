@@ -8,6 +8,7 @@ import {
   DEFAULT_SEARCH_LIMIT,
   DEFAULT_TEXT_CHARS,
   DEFAULT_TOOL_OUTPUT_CHARS,
+  isCrossThreadInputEnvelope,
   matchedKeywords,
   nonEmptyKeywords,
   parseLimit,
@@ -33,6 +34,7 @@ const PERSISTENT_SYSTEM_INPUT_TRUNCATION_NOTICE =
 
 interface FindTextRow {
   session_id: string;
+  rollout_id: string;
   thread_name: string | null;
   cwd: string | null;
   updated_at: string | null;
@@ -53,7 +55,6 @@ type MessageQueryRow = Record<string, unknown> & {
   timestamp: string | null;
   role: string;
   content_text: string;
-  content_json: string | null;
   raw_json?: string;
 };
 
@@ -73,8 +74,12 @@ type ToolQueryRow = Record<string, unknown> & {
 
 type LocatorLookupRow = Record<string, unknown> & {
   session_id: string;
+  rollout_id: string;
   sequence: number;
   timestamp: string | null;
+  source: string;
+  tool_name: string;
+  call_id: string | null;
 };
 
 export class CodexSessionQueries {
@@ -136,6 +141,11 @@ export class CodexSessionQueries {
         data: { token }
       };
     }
+
+    const generated = rows.filter((row) =>
+      row.source === "tool_output" && isSessionTokenTool(row.tool_name)
+    );
+    if (generated.length > 0) rows = deduplicateGeneratedLocators(generated);
 
     const sessionIds = [...new Set(rows.map((row) => row.session_id))];
     if (sessionIds.length !== 1) {
@@ -230,12 +240,12 @@ export class CodexSessionQueries {
     const rows = this.db
       .prepare(
         `SELECT
-           session_id, thread_name, cwd, updated_at, archive_scope,
+           session_id, rollout_id, thread_name, cwd, updated_at, archive_scope,
            sequence, timestamp, source_type, role, searchable_text,
            token, call_id, tool_name, occurrences
          FROM (
            SELECT
-             s.session_id, s.thread_name, s.cwd, s.updated_at, s.archive_scope,
+             s.session_id, m.rollout_id, s.thread_name, s.cwd, s.updated_at, s.archive_scope,
              m.sequence, m.timestamp, 'message' AS source_type,
              m.role, m.content_text AS searchable_text,
              NULL AS token, NULL AS call_id, NULL AS tool_name,
@@ -248,41 +258,62 @@ export class CodexSessionQueries {
            UNION ALL
 
            SELECT
-             s.session_id, s.thread_name, s.cwd, s.updated_at, s.archive_scope,
+             s.session_id, i.rollout_id, s.thread_name, s.cwd, s.updated_at, s.archive_scope,
              i.sequence, i.timestamp, 'published_task_retrieval' AS source_type,
              NULL AS role, i.task_text AS searchable_text,
-             i.token, i.call_id, i.tool_name, grouped.occurrences
+             i.token, i.call_id, i.tool_name, 1 AS occurrences
            FROM session_task_inputs i
-           JOIN (
-             SELECT active_input.session_id, active_input.token,
-                    MAX(active_input.sequence) AS sequence, COUNT(*) AS occurrences
-             FROM session_task_inputs active_input
-             LEFT JOIN session_turns input_turn ON input_turn.id = active_input.turn_ref
-             WHERE active_input.turn_ref IS NULL OR input_turn.rewound = 0
-             GROUP BY active_input.session_id, active_input.token
-           ) grouped
-             ON grouped.session_id = i.session_id
-            AND grouped.token = i.token
-            AND grouped.sequence = i.sequence
+           LEFT JOIN session_turns input_turn ON input_turn.id = i.turn_ref
            JOIN sessions s ON s.session_id = i.session_id
+           WHERE i.turn_ref IS NULL OR input_turn.rewound = 0
          )
          WHERE ${where.join(" AND ")}
          ORDER BY archive_scope ASC, updated_at DESC, sequence DESC
-         LIMIT 25`
+         LIMIT 1000`
       )
       .all(...params) as FindTextRow[];
 
-    if (rows.length === 0) {
+    const viewCache = new Map<string, ReturnType<typeof resolveSessionHistory>>();
+    const effective = rows.flatMap((row) => {
+      const view = viewCache.get(row.session_id) ?? resolveSessionHistory(this.db, row.session_id);
+      viewCache.set(row.session_id, view);
+      const segment = view.segments.find((candidate) =>
+        candidate.rolloutId === row.rollout_id &&
+        row.sequence >= candidate.minSequence &&
+        (candidate.maxSequence === null || row.sequence <= candidate.maxSequence)
+      );
+      return segment ? [{ ...row, sequence: row.sequence + segment.sequenceOffset }] : [];
+    });
+    const taskGroups = new Map<string, FindTextRow>();
+    const messages: FindTextRow[] = [];
+    for (const row of effective) {
+      if (row.source_type === "message") {
+        messages.push(row);
+        continue;
+      }
+      const key = `${row.session_id}\n${row.token}`;
+      const existing = taskGroups.get(key);
+      if (!existing || row.sequence > existing.sequence) {
+        taskGroups.set(key, { ...row, occurrences: (existing?.occurrences ?? 0) + 1 });
+      } else {
+        existing.occurrences += 1;
+      }
+    }
+    const activeRows = [...messages, ...taskGroups.values()]
+      .sort((left, right) => right.sequence - left.sequence)
+      .slice(0, 25);
+
+    if (activeRows.length === 0) {
       return { status: "not_found", error: "no message or published task retrieval matched the provided text" };
     }
-    if (rows.length !== 1) {
+    if (activeRows.length !== 1) {
       const response: Record<string, unknown> = {
         status: "ambiguous",
         error: "text matched multiple messages or published task retrievals; provide a longer, more distinctive original snippet",
-        match_count: rows.length
+        match_count: activeRows.length
       };
       if (args.include_candidates) {
-        response.candidates = rows.map((row) => ({
+        response.candidates = activeRows.map((row) => ({
           session_id: row.session_id,
           thread_name: row.thread_name,
           updated_at: row.updated_at,
@@ -293,7 +324,7 @@ export class CodexSessionQueries {
       return response;
     }
 
-    const row = rows[0];
+    const row = activeRows[0];
     const match = findTextMatch(row, text, args.max_chars ?? 500);
     const legacyMessage = row.source_type === "message"
       ? {
@@ -340,9 +371,9 @@ export class CodexSessionQueries {
     const to = parseTimeToUtcIso(args.time_to);
     const view = resolveSessionHistory(this.db, args.session_id);
     let rows: MessageQueryRow[] = view.segments.flatMap((segment) => {
-      const params: unknown[] = [segment.sessionId, segment.minSequence];
+      const params: unknown[] = [segment.rolloutId, segment.minSequence];
       const where = [
-        "m.session_id = ?",
+        "m.rollout_id = ?",
         "m.sequence >= ?",
         "(m.turn_ref IS NULL OR message_turn.rewound = 0)"
       ];
@@ -366,7 +397,7 @@ export class CodexSessionQueries {
       const rawJoin = args.include_raw ? "JOIN raw_events r ON r.id = m.raw_event_id" : "";
       return (this.db
         .prepare(
-          `SELECT m.sequence, m.timestamp, m.role, m.content_text, m.content_json${rawSelect}
+          `SELECT m.sequence, m.timestamp, m.role, m.content_text${rawSelect}
            FROM messages m
            LEFT JOIN session_turns message_turn ON message_turn.id = m.turn_ref
            ${rawJoin}
@@ -402,7 +433,6 @@ export class CodexSessionQueries {
           timestamp: row.timestamp,
           role: row.role,
           content_text: truncateText(row.content_text, maxChars),
-          content_json: row.content_json,
           raw_json: args.include_raw ? row.raw_json : undefined
         })),
         ...(view.parentHistoryStatus ? { parent_history_status: view.parentHistoryStatus } : {})
@@ -420,8 +450,8 @@ export class CodexSessionQueries {
     const rows = view.segments.flatMap((segment) => {
       const range = segment.maxSequence === null ? "" : "AND m.sequence <= ?";
       const taskRange = segment.maxSequence === null ? "" : "AND i.sequence <= ?";
-      const userParams: unknown[] = [segment.sessionId, segment.minSequence];
-      const taskParams: unknown[] = [segment.sessionId, segment.minSequence];
+      const userParams: unknown[] = [segment.rolloutId, segment.minSequence];
+      const taskParams: unknown[] = [segment.rolloutId, segment.minSequence];
       if (segment.maxSequence !== null) {
         userParams.push(segment.maxSequence);
         taskParams.push(segment.maxSequence);
@@ -439,7 +469,7 @@ export class CodexSessionQueries {
            FROM messages m
            LEFT JOIN session_turns user_turn ON user_turn.id = m.turn_ref
            ${userRawJoin}
-           WHERE m.session_id = ? AND m.sequence >= ? ${range} AND m.role = 'user'
+           WHERE m.rollout_id = ? AND m.sequence >= ? ${range} AND m.role = 'user'
              AND (m.turn_ref IS NULL OR user_turn.rewound = 0)`
         )
         .all(...userParams) as Array<Record<string, unknown> & { sequence: number }>;
@@ -452,7 +482,7 @@ export class CodexSessionQueries {
            FROM session_task_inputs i
            LEFT JOIN session_turns task_turn ON task_turn.id = i.turn_ref
            ${taskRawJoin}
-           WHERE i.session_id = ? AND i.sequence >= ? ${taskRange}
+           WHERE i.rollout_id = ? AND i.sequence >= ? ${taskRange}
              AND (i.turn_ref IS NULL OR task_turn.rewound = 0)`
         )
         .all(...taskParams) as Array<Record<string, unknown> & { sequence: number }>;
@@ -474,10 +504,13 @@ export class CodexSessionQueries {
        }>;
 
     const inputs = rows.map((row) => {
+      const inputType = row.input_type === "user_message" && isCrossThreadInputEnvelope(row.content_text)
+        ? "cross_thread_message"
+        : row.input_type;
       const common = {
         sequence: row.sequence,
         timestamp: row.timestamp,
-        input_type: row.input_type
+        input_type: inputType
       };
       if (row.input_type === "published_task_retrieval") {
         return {
@@ -526,9 +559,9 @@ export class CodexSessionQueries {
     const to = parseTimeToUtcIso(args.time_to);
     const view = resolveSessionHistory(this.db, args.session_id);
     let rows: ToolQueryRow[] = view.segments.flatMap((segment) => {
-      const params: unknown[] = [segment.sessionId, segment.minSequence];
+      const params: unknown[] = [segment.rolloutId, segment.minSequence];
       const where = [
-        "t.session_id = ?",
+        "t.rollout_id = ?",
         "t.sequence >= ?",
         "(t.turn_ref IS NULL OR tool_turn.rewound = 0)"
       ];
@@ -672,9 +705,9 @@ export class CodexSessionQueries {
     includeRaw: boolean;
     maxChars: number;
   }): Array<Record<string, unknown>> {
-    const params: unknown[] = [options.segment.sessionId, options.segment.minSequence];
+    const params: unknown[] = [options.segment.rolloutId, options.segment.minSequence];
     const where = [
-      "m.session_id = ?",
+      "m.rollout_id = ?",
       "m.sequence >= ?",
       "(m.turn_ref IS NULL OR message_turn.rewound = 0)"
     ];
@@ -736,9 +769,9 @@ export class CodexSessionQueries {
     includeRaw: boolean;
     maxChars: number;
   }): Array<Record<string, unknown>> {
-    const params: unknown[] = [options.segment.sessionId, options.segment.minSequence];
+    const params: unknown[] = [options.segment.rolloutId, options.segment.minSequence];
     const where = [
-      "t.session_id = ?",
+      "t.rollout_id = ?",
       "t.sequence >= ?",
       "(t.turn_ref IS NULL OR tool_turn.rewound = 0)"
     ];
@@ -804,8 +837,8 @@ export class CodexSessionQueries {
     includeRaw: boolean;
     maxChars: number;
   }): Array<Record<string, unknown>> {
-    const params: unknown[] = [options.segment.sessionId, options.segment.minSequence];
-    const where = ["session_id = ?", "sequence >= ?"];
+    const params: unknown[] = [options.segment.rolloutId, options.segment.minSequence];
+    const where = ["rollout_id = ?", "sequence >= ?"];
     if (options.segment.maxSequence !== null) {
       where.push("sequence <= ?");
       params.push(options.segment.maxSequence);
@@ -875,6 +908,7 @@ export class CodexSessionQueries {
         `SELECT
            l.token,
            l.session_id,
+           l.rollout_id,
            l.sequence,
            l.timestamp,
            l.call_id,
@@ -887,7 +921,9 @@ export class CodexSessionQueries {
          FROM session_locator_tokens l
          JOIN sessions s ON s.session_id = l.session_id
          WHERE l.token = ?
-         ORDER BY l.timestamp DESC, l.sequence DESC`
+           AND (l.timestamp IS NULL OR s.created_at IS NULL OR l.timestamp >= s.created_at)
+         ORDER BY CASE WHEN l.source = 'tool_output' THEN 0 ELSE 1 END,
+                  l.timestamp DESC, l.sequence DESC`
       )
       .all(token) as LocatorLookupRow[];
   }
@@ -927,7 +963,9 @@ function findTextMatch(row: FindTextRow, text: string, maxChars: number): Record
     input_type: row.source_type === "published_task_retrieval"
       ? "published_task_retrieval"
       : row.role === "user"
-        ? "user_message"
+        ? isCrossThreadInputEnvelope(row.searchable_text)
+          ? "cross_thread_message"
+          : "user_message"
         : "message",
     sequence: row.sequence,
     timestamp: row.timestamp,
@@ -974,6 +1012,26 @@ function markerForToken(token: string): string {
 
 function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function isSessionTokenTool(toolName: string): boolean {
+  return toolName === "codex_session_get_session_token" || toolName.endsWith(".codex_session_get_session_token");
+}
+
+function deduplicateGeneratedLocators(rows: LocatorLookupRow[]): LocatorLookupRow[] {
+  const byCall = new Map<string, LocatorLookupRow>();
+  for (const row of rows) {
+    const key = row.call_id ?? `${row.rollout_id}:${row.sequence}`;
+    const existing = byCall.get(key);
+    if (!existing || compareLocatorOrigin(row, existing) < 0) byCall.set(key, row);
+  }
+  return [...byCall.values()];
+}
+
+function compareLocatorOrigin(left: LocatorLookupRow, right: LocatorLookupRow): number {
+  const leftTime = left.timestamp ?? "";
+  const rightTime = right.timestamp ?? "";
+  return leftTime.localeCompare(rightTime) || left.sequence - right.sequence;
 }
 
 function delay(ms: number): Promise<void> {

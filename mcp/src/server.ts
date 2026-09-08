@@ -138,13 +138,13 @@ export function createMcpServer(runtime: SessionRuntime): McpServer {
   registerJsonTool(server, "codex_session_recent_user_inputs", {
     title: "Recent Codex Session Inputs",
     description:
-      "Return the most recent effective inputs in a session: ordinary user messages and successful codex_session_get_task retrievals, each with an explicit input_type. Defaults to the last 3 inputs.",
+      "Return the most recent effective inputs in a session: ordinary user messages, cross-thread messages, and successful codex_session_get_task retrievals, each with an explicit input_type. Defaults to the last 3 inputs.",
     inputSchema: {
       session_id: z.string().min(1),
       limit: z.number().int().positive().max(100).optional(),
       include_raw: z.boolean().optional(),
       max_chars: z.number().int().positive().max(100000).optional()
-        .describe("Maximum characters returned for each ordinary user message or published task text. Persistent recommended_plugins and AGENTS.md system inputs are always collapsed to fixed identifying prefixes.")
+        .describe("Maximum characters returned for each ordinary user message, cross-thread message, or published task text. Persistent recommended_plugins and AGENTS.md system inputs are always collapsed to fixed identifying prefixes.")
     }
   }, async (args) => queries.recentUserInputs(args));
 
